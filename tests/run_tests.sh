@@ -110,13 +110,26 @@ painted=$("$BIN" bake "$W/bake_painted.patina.json" --force --compact | json "d[
 "$PY" -c "import sys; sys.exit(0 if float('$painted') < float('$tight') and float('$tight') > 0 else 1)" || fail "painted cage should fix misses ($tight -> $painted)"
 ok "explicit cage mesh, painted cage mask, AO from the high poly"
 
+# with a high poly the mesh maps describe its surface: the crease around the plate's raised panel only exists
+# there, so it is in the curvature map when that comes from the high poly and not when it comes from the low
+out=$("$BIN" bake "$W/bake.patina.json" --force --dump "$W/maps_high" --compact)
+[ "$(echo "$out" | json "(d['stats']['normal']['ao'], d['stats']['normal']['curvature'])")" = "('high', 'high')" ] || fail "mesh maps should come from the high poly"
+sed 's/"cage": 0.03,/"cage": 0.03, "curvature_from_high": false, "ao_from_high": false,/' "$W/bake.patina.json" > "$W/bake_lowmaps.patina.json"
+out=$("$BIN" bake "$W/bake_lowmaps.patina.json" --force --dump "$W/maps_low" --compact)
+[ "$(echo "$out" | json "(d['stats']['normal']['ao'], d['stats']['normal']['curvature'])")" = "('low', 'low')" ] || fail "mesh maps should stay on the low poly"
+concave_high=$("$PY" tests/map_stats.py "$W/maps_high/Plate_curvature.png" | cut -d' ' -f1)
+concave_low=$("$PY" tests/map_stats.py "$W/maps_low/Plate_curvature.png" | cut -d' ' -f1)
+"$PY" -c "import sys; sys.exit(0 if float('$concave_high') > 0.005 and float('$concave_low') < 0.001 else 1)" || fail "curvature should follow the high poly (concave: $concave_high from the high, $concave_low from the low)"
+ok "AO, thickness and curvature from the high poly"
+
 # GPU baker: `bake --verify` bakes on the GPU and on the CPU and compares every map. Runs on this machine's GPU
 # when it has one, otherwise on Direct3D's software rasterizer (CI), and is skipped where there is no backend.
 gpu_of() { "$BIN" bake "$1" --verify --compact | json "d['verify']['gpu']"; }
 gpu_env=${PATINA_GPU-}
 [ "$(gpu_of "$W/crate.patina.json")" != "None" ] || export PATINA_GPU=warp
 if [ "$(gpu_of "$W/crate.patina.json")" != "None" ]; then
-  for p in crate bake bake_fixed bake_cage bevel; do  # AO + thickness, projection (auto skew, fixed skew, cage mesh), bevel
+  # AO + thickness, projection with the maps on the high poly (auto skew, fixed skew, cage mesh) and on the low, bevel
+  for p in crate bake bake_fixed bake_cage bake_lowmaps bevel; do
     out=$("$BIN" bake "$W/$p.patina.json" --verify --compact)
     [ "$(echo "$out" | json "d['verify']['ok']")" = "True" ] || fail "GPU and CPU bakes of $p differ: $out"
   done

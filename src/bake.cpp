@@ -9,7 +9,6 @@
 #include <filesystem>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
 
 #include "bake_gpu.h"
 
@@ -404,21 +403,20 @@ static inline float radical_inverse(uint32_t b) {
   return (float)b * 2.3283064365386963e-10f;
 }
 
-// AO and thickness of the low poly, traced on the GPU (`scene` holds the low-poly BVH) or, with gpu == null,
-// on all cores. The surface kernel in shaders/bake.hlsl mirrors the two estimators here.
-static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, const BakeSettings& s, Gpu* gpu, const GpuScene& scene) {
-  float ext = m.max_extent();
+// The surface kernel in shaders/bake.hlsl mirrors the two estimators here.
+void trace_ao_thickness(const BVH& bvh, const BakeSettings& s, float ext, Gpu* gpu, const GpuScene& scene, uint32_t scene_bvh, size_t count,
+                        const std::function<GpuSample(size_t)>& point, float* ao_out, float* thickness_out) {
   float eps = ext * 2e-5f;
   float ao_maxd = s.ao_distance * ext, th_maxd = s.thickness_distance * ext;
   int ao_n = s.ao_samples, th_n = s.thickness_samples;
   auto ao_value = [&](int hits, int valid) { return valid ? 1.f - (float)hits / valid : 1.f; };
   auto thickness_value = [&](float sum) { return saturate(sum / (th_n * th_maxd)); };
-  auto ao = [&](size_t i) {
-    vec3 n = ss.nrm[i], fn = ss.fnrm[i];
-    vec3 o = ss.pos[i] + fn * eps + n * eps;
+  auto ao = [&](const GpuSample& p) {
+    vec3 n = p.nrm, fn = p.fnrm;
+    vec3 o = p.pos + fn * eps + n * eps;
     vec3 t, bt;
     onb(n, t, bt);
-    float r1 = hash_float((uint32_t)i * 2u + 17u), r2 = hash_float((uint32_t)i * 2u + 91u);
+    float r1 = hash_float(p.seed * 2u + 17u), r2 = hash_float(p.seed * 2u + 91u);
     int hits = 0, valid = 0;
     for (int k = 0; k < ao_n; k++) {
       float u1 = (k + r1) / ao_n;
@@ -432,12 +430,12 @@ static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, cons
     }
     return ao_value(hits, valid);
   };
-  auto thickness = [&](size_t i) {
-    vec3 n = -ss.nrm[i], fn = -ss.fnrm[i];
-    vec3 o = ss.pos[i] + fn * eps;
+  auto thickness = [&](const GpuSample& p) {
+    vec3 n = -p.nrm, fn = -p.fnrm;
+    vec3 o = p.pos + fn * eps;
     vec3 t, bt;
     onb(n, t, bt);
-    float r1 = hash_float((uint32_t)i * 2u + 7u), r2 = hash_float((uint32_t)i * 2u + 3u);
+    float r1 = hash_float(p.seed * 2u + 7u), r2 = hash_float(p.seed * 2u + 3u);
     float sum = 0;
     for (int k = 0; k < th_n; k++) {
       float u1 = (k + r1) / th_n;
@@ -452,39 +450,44 @@ static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, cons
     }
     return thickness_value(sum);
   };
-  eval_subsampled<2>(ss, {&ss.ao, &ss.thickness}, [&](const std::vector<uint32_t>& ids, std::array<std::vector<float>, 2>& out) {
-    if (!gpu) {
-      parallel_for((int64_t)ids.size(), 64, [&](int64_t b, int64_t e) {
-        for (int64_t j = b; j < e; j++) out[0][j] = ao(ids[j]);
-      });
-      parallel_for((int64_t)ids.size(), 64, [&](int64_t b, int64_t e) {
-        for (int64_t j = b; j < e; j++) out[1][j] = thickness(ids[j]);
-      });
-      return;
-    }
-    GpuParams p;
-    p.eps = eps;
-    p.samples = (uint32_t)ao_n;
-    p.maxd = ao_maxd;
-    p.thickness_samples = (uint32_t)th_n;
-    p.thickness_maxd = th_maxd;
-    gpu_run(*gpu, GpuKernel::Surface, p, scene, ids.size(), sizeof(GpuSample), sizeof(GpuSurfaceOut), (uint64_t)ao_n + th_n,
-            [&](size_t first, size_t count, void* dst) {
-              GpuSample* r = (GpuSample*)dst;
-              parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
-                for (int64_t j = b; j < e; j++) {
-                  uint32_t i = ids[first + j];
-                  r[j] = {ss.pos[i], i, ss.nrm[i], 0.f, ss.fnrm[i], 0.f};
-                }
-              });
-            },
-            [&](size_t first, size_t count, const void* src) {
-              const GpuSurfaceOut* r = (const GpuSurfaceOut*)src;
-              for (size_t j = 0; j < count; j++) {
-                out[0][first + j] = ao_value((int)(r[j].ao >> 16), (int)(r[j].ao & 0xffffu));
-                out[1][first + j] = thickness_value(r[j].thickness);
-              }
+  if (!gpu) {
+    parallel_for((int64_t)count, 64, [&](int64_t b, int64_t e) {
+      for (int64_t j = b; j < e; j++) ao_out[j] = ao(point((size_t)j));
+    });
+    parallel_for((int64_t)count, 64, [&](int64_t b, int64_t e) {
+      for (int64_t j = b; j < e; j++) thickness_out[j] = thickness(point((size_t)j));
+    });
+    return;
+  }
+  GpuParams p;
+  p.eps = eps;
+  p.bvh = scene_bvh;
+  p.samples = (uint32_t)ao_n;
+  p.maxd = ao_maxd;
+  p.thickness_samples = (uint32_t)th_n;
+  p.thickness_maxd = th_maxd;
+  gpu_run(*gpu, GpuKernel::Surface, p, scene, count, sizeof(GpuSample), sizeof(GpuSurfaceOut), (uint64_t)ao_n + th_n,
+          [&](size_t first, size_t chunk, void* dst) {
+            GpuSample* r = (GpuSample*)dst;
+            parallel_for((int64_t)chunk, 4096, [&](int64_t b, int64_t e) {
+              for (int64_t j = b; j < e; j++) r[j] = point(first + (size_t)j);
             });
+          },
+          [&](size_t first, size_t chunk, const void* src) {
+            const GpuSurfaceOut* r = (const GpuSurfaceOut*)src;
+            for (size_t j = 0; j < chunk; j++) {
+              ao_out[first + j] = ao_value((int)(r[j].ao >> 16), (int)(r[j].ao & 0xffffu));
+              thickness_out[first + j] = thickness_value(r[j].thickness);
+            }
+          });
+}
+
+// AO and thickness of the low poly (`scene` holds its BVH).
+static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, const BakeSettings& s, Gpu* gpu, const GpuScene& scene) {
+  eval_subsampled<2>(ss, {&ss.ao, &ss.thickness}, [&](const std::vector<uint32_t>& ids, std::array<std::vector<float>, 2>& out) {
+    trace_ao_thickness(bvh, s, m.max_extent(), gpu, scene, 0, ids.size(),
+                       [&](size_t j) { uint32_t i = ids[j]; return GpuSample{ss.pos[i], i, ss.nrm[i], 0.f, ss.fnrm[i], 0.f}; },
+                       out[0].data(), out[1].data());
   });
   parallel_for(2, 1, [&](int64_t b, int64_t e) {
     for (int64_t k = b; k < e; k++) denoise_samples(ss, k == 0 ? ss.ao : ss.thickness);
@@ -492,132 +495,215 @@ static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, cons
 }
 
 // ---------------------------------------------------------------- curvature
-// Edge-integral curvature: every mesh edge with dihedral angle theta contributes theta * length,
-// smoothed by a kernel of radius r in 3D. This gives crisp, resolution-independent convex/concave
-// masks on low-poly hard-surface meshes (where vertex curvature fails) and ~mean curvature on
-// smooth dense meshes. Output: 0.5 = flat, >0.5 convex, <0.5 concave.
+namespace {
 struct EdgeSamples {
   std::vector<vec3> p, n;
   std::vector<float> w;
+  std::vector<uint32_t> shell;
 };
+}  // namespace
 
-static EdgeSamples curvature_edges(const Mesh& m, float r, float min_angle_deg) {
+size_t CurvatureField::cell_of(vec3 p, int& x, int& y, int& z) const {
+  x = std::clamp((int)((p.x - lo_.x) / cell_), 0, gx_ - 1);
+  y = std::clamp((int)((p.y - lo_.y) / cell_), 0, gy_ - 1);
+  z = std::clamp((int)((p.z - lo_.z) / cell_), 0, gz_ - 1);
+  return ((size_t)z * gy_ + y) * gx_ + x;
+}
+
+void CurvatureField::build(const Mesh& m, float r, float min_angle_deg, const BVH* solid) {
+  r_ = r;
+  size_t nt = m.tri_count();
   uint32_t wc = 0;
-  auto weld = weld_by_position(m, &wc);
-  struct EdgeRec { uint32_t t0, t1; int count; };
-  std::unordered_map<uint64_t, EdgeRec> edges;
-  edges.reserve(m.tri_count() * 2);
-  for (size_t t = 0; t < m.tri_count(); t++) {
-    for (int e = 0; e < 3; e++) {
-      uint32_t a = weld[m.idx[t * 3 + e]], b = weld[m.idx[t * 3 + (e + 1) % 3]];
-      if (a == b) continue;
-      if (a > b) std::swap(a, b);
-      uint64_t key = ((uint64_t)a << 32) | b;
-      auto it = edges.find(key);
-      if (it == edges.end()) edges.emplace(key, EdgeRec{(uint32_t)t, 0, 1});
-      else { if (it->second.count == 1) it->second.t1 = (uint32_t)t; it->second.count++; }
-    }
-  }
+  std::vector<uint32_t> weld = weld_by_position(m, &wc);
   // representative position for each welded vertex
   std::vector<vec3> wpos(wc);
   for (size_t v = 0; v < m.pos.size(); v++) wpos[weld[v]] = m.pos[v];
-  auto face_n = [&](uint32_t t) {
-    return normalize(cross(m.pos[m.idx[t * 3 + 1]] - m.pos[m.idx[t * 3]], m.pos[m.idx[t * 3 + 2]] - m.pos[m.idx[t * 3]]));
+  auto face_n = [&](uint32_t t, vec3& n) {
+    vec3 c = cross(m.pos[m.idx[t * 3 + 1]] - m.pos[m.idx[t * 3]], m.pos[m.idx[t * 3 + 2]] - m.pos[m.idx[t * 3]]);
+    float l = length(c);
+    n = l > 1e-20f ? c / l : vec3(0, 0, 1);
+    return l > 1e-20f;
   };
-  auto centroid = [&](uint32_t t) { return (m.pos[m.idx[t * 3]] + m.pos[m.idx[t * 3 + 1]] + m.pos[m.idx[t * 3 + 2]]) / 3.f; };
-  float min_angle = min_angle_deg * kPi / 180.f;
-  float spacing = r * 0.25f;
-  EdgeSamples es;
-  for (auto& kv : edges) {
-    const EdgeRec& er = kv.second;
-    if (er.count != 2) continue;
-    vec3 n0 = face_n(er.t0), n1 = face_n(er.t1);
-    float theta = std::acos(clampf(dot(n0, n1), -1.f, 1.f));
-    if (theta < min_angle) continue;
-    vec3 a = wpos[(uint32_t)(kv.first >> 32)], b = wpos[(uint32_t)(kv.first & 0xffffffffu)];
-    vec3 mid = (a + b) * 0.5f;
-    bool convex = dot(n0, centroid(er.t1) - mid) < 0.f;
-    float signed_theta = convex ? theta : -theta;
-    float L = length(b - a);
-    int cnt = std::max(1, (int)std::ceil(L / spacing));
-    float seg = L / cnt;
-    vec3 en = normalize(n0 + n1);
-    for (int k = 0; k < cnt; k++) {
-      es.p.push_back(a + (b - a) * ((k + 0.5f) / cnt));
-      es.n.push_back(en);
-      es.w.push_back(signed_theta * seg);
-    }
-  }
-  return es;
-}
 
-static void bake_curvature(const Mesh& m, const EdgeSamples& es, std::vector<SampleSet*>& sets, const BakeSettings& s) {
-  float ext = m.max_extent();
-  float r = s.curvature_radius * ext;
-  vec3 lo = m.bmin - vec3(r), hi = m.bmax + vec3(r);
-  vec3 sz = hi - lo;
-  float cell = std::fmax(r, std::fmax(sz.x, std::fmax(sz.y, sz.z)) / 192.f);
-  int gx = std::max(1, (int)std::ceil(sz.x / cell)), gy = std::max(1, (int)std::ceil(sz.y / cell)), gz = std::max(1, (int)std::ceil(sz.z / cell));
-  auto cell_of = [&](vec3 p, int& x, int& y, int& z) {
-    x = std::clamp((int)((p.x - lo.x) / cell), 0, gx - 1);
-    y = std::clamp((int)((p.y - lo.y) / cell), 0, gy - 1);
-    z = std::clamp((int)((p.z - lo.z) / cell), 0, gz - 1);
-  };
-  size_t ncell = (size_t)gx * gy * gz;
-  std::vector<uint32_t> start(ncell + 1, 0);
-  std::vector<uint32_t> cell_id(es.p.size());
-  for (size_t i = 0; i < es.p.size(); i++) {
-    int x, y, z;
-    cell_of(es.p[i], x, y, z);
-    cell_id[i] = (uint32_t)(((size_t)z * gy + y) * gx + x);
-    start[cell_id[i] + 1]++;
-  }
-  for (size_t c = 0; c < ncell; c++) start[c + 1] += start[c];
-  // edge samples in cell order, and whether a cell has any within reach (most texels are nowhere near an edge)
-  std::vector<vec3> sp(es.p.size()), sn(es.p.size());
-  std::vector<float> sw(es.p.size());
-  std::vector<uint8_t> reach(ncell, 0);
-  {
-    std::vector<uint32_t> fill(start.begin(), start.end() - 1);
-    for (size_t i = 0; i < es.p.size(); i++) {
-      uint32_t k = fill[cell_id[i]]++;
-      sp[k] = es.p[i];
-      sn[k] = es.n[i];
-      sw[k] = es.w[i];
-      int cx = (int)(cell_id[i] % gx), cy = (int)(cell_id[i] / gx % gy), cz = (int)(cell_id[i] / ((size_t)gx * gy));
-      for (int z = std::max(0, cz - 1); z <= std::min(gz - 1, cz + 1); z++)
-        for (int y = std::max(0, cy - 1); y <= std::min(gy - 1, cy + 1); y++)
-          for (int x = std::max(0, cx - 1); x <= std::min(gx - 1, cx + 1); x++) reach[((size_t)z * gy + y) * gx + x] = 1;
+  // connected pieces of surface: triangles joined through welded vertices
+  size_t shells = 0;
+  if (solid) {
+    std::vector<uint32_t> parent(wc);
+    for (uint32_t v = 0; v < wc; v++) parent[v] = v;
+    auto find = [&](uint32_t v) {
+      while (parent[v] != v) v = parent[v] = parent[parent[v]];
+      return v;
+    };
+    for (size_t t = 0; t < nt; t++) {
+      uint32_t a = find(weld[m.idx[t * 3]]);
+      for (int k = 1; k < 3; k++) parent[find(weld[m.idx[t * 3 + k]])] = a;
+    }
+    tri_shell.resize(nt);
+    std::vector<uint8_t> seen(wc, 0);
+    for (size_t t = 0; t < nt; t++) {
+      tri_shell[t] = find(weld[m.idx[t * 3]]);
+      shells += !seen[tri_shell[t]];
+      seen[tri_shell[t]] = 1;
     }
   }
-  float r2 = r * r;
-  float norm = 3.f / (kPi * r2);  // 1 / integral of (1-d^2/r^2)^2 over the disk
-  for (SampleSet* ss : sets) {
-    ss->curvature.assign(ss->size(), 0.5f);
-    parallel_for((int64_t)ss->size(), 256, [&](int64_t b, int64_t e) {
+
+  // every triangle side, filed under the lower of its two welded vertices: an edge's two sides end up together
+  struct Side { uint32_t hi, tri; };
+  std::vector<uint32_t> first(wc + 1, 0);
+  auto for_sides = [&](auto&& fn) {
+    for (size_t t = 0; t < nt; t++)
+      for (int e = 0; e < 3; e++) {
+        uint32_t a = weld[m.idx[t * 3 + e]], b = weld[m.idx[t * 3 + (e + 1) % 3]];
+        if (a != b) fn(std::min(a, b), std::max(a, b), (uint32_t)t);
+      }
+  };
+  for_sides([&](uint32_t lo, uint32_t, uint32_t) { first[lo + 1]++; });
+  for (uint32_t v = 0; v < wc; v++) first[v + 1] += first[v];
+  std::vector<Side> sides(first[wc]);
+  {
+    std::vector<uint32_t> fill(first.begin(), first.end() - 1);
+    for_sides([&](uint32_t lo, uint32_t hi, uint32_t t) { sides[fill[lo]++] = {hi, t}; });
+  }
+
+  // edge samples, a block of vertices at a time (in vertex order whatever the thread count)
+  float min_angle = std::fmax(min_angle_deg * kPi / 180.f, 1e-4f);
+  float spacing = r * 0.25f;
+  const int64_t kBlock = 4096;
+  std::vector<EdgeSamples> blocks(((size_t)wc + kBlock - 1) / kBlock);
+  parallel_for((int64_t)wc, kBlock, [&](int64_t v0, int64_t v1) {
+    for (int64_t k = v0 / kBlock; k * kBlock < v1; k++) {
+      EdgeSamples& es = blocks[k];
+      for (uint32_t lo = (uint32_t)(k * kBlock), end = (uint32_t)std::min<int64_t>((k + 1) * kBlock, wc); lo < end; lo++) {
+        Side* s0 = sides.data() + first[lo], *s1 = sides.data() + first[lo + 1];
+        std::sort(s0, s1, [](const Side& x, const Side& y) { return x.hi != y.hi ? x.hi < y.hi : x.tri < y.tri; });
+        for (Side* s = s0, *next; s < s1; s = next) {
+          for (next = s + 1; next < s1 && next->hi == s->hi;) next++;
+          if (next - s != 2) continue;  // an open border, or more than two faces on one edge
+          uint32_t t0 = s[0].tri, t1 = s[1].tri;
+          vec3 n0, n1;
+          if (!face_n(t0, n0) || !face_n(t1, n1)) continue;
+          float theta = std::atan2(length(cross(n0, n1)), dot(n0, n1));
+          if (theta < min_angle) continue;
+          vec3 a = wpos[lo], b = wpos[s->hi];
+          vec3 mid = (a + b) * 0.5f;
+          vec3 c1 = (m.pos[m.idx[t1 * 3]] + m.pos[m.idx[t1 * 3 + 1]] + m.pos[m.idx[t1 * 3 + 2]]) / 3.f;
+          bool convex = dot(n0, c1 - mid) < 0.f;
+          float signed_theta = convex ? theta : -theta;
+          float L = length(b - a);
+          int cnt = std::max(1, (int)std::ceil(L / spacing));
+          float seg = L / cnt;
+          vec3 en = normalize(n0 + n1);
+          for (int j = 0; j < cnt; j++) {
+            es.p.push_back(a + (b - a) * ((j + 0.5f) / cnt));
+            es.n.push_back(en);
+            es.w.push_back(signed_theta * seg);
+            if (solid) es.shell.push_back(tri_shell[t0]);
+          }
+        }
+      }
+    }
+  });
+  EdgeSamples es;
+  {
+    size_t total = 0;
+    for (auto& blk : blocks) total += blk.w.size();
+    es.p.reserve(total);
+    es.n.reserve(total);
+    es.w.reserve(total);
+    if (solid) es.shell.reserve(total);
+    for (auto& blk : blocks) {
+      es.p.insert(es.p.end(), blk.p.begin(), blk.p.end());
+      es.n.insert(es.n.end(), blk.n.begin(), blk.n.end());
+      es.w.insert(es.w.end(), blk.w.begin(), blk.w.end());
+      es.shell.insert(es.shell.end(), blk.shell.begin(), blk.shell.end());
+      blk = EdgeSamples();
+    }
+  }
+
+  // An edge inside another piece's solid is not part of the visible surface: looking out from it along its
+  // normal, the first thing seen is then the inside of a wall.
+  if (solid && shells > 1 && !solid->empty()) {
+    float lift = m.max_extent() * 1e-4f;
+    std::vector<uint8_t> keep(es.w.size());
+    parallel_for((int64_t)es.w.size(), 256, [&](int64_t b, int64_t e) {
       for (int64_t i = b; i < e; i++) {
-        vec3 p = ss->pos[i], n = ss->nrm[i];
-        int cx, cy, cz;
-        cell_of(p, cx, cy, cz);
-        if (!reach[((size_t)cz * gy + cy) * gx + cx]) continue;  // flat: stays 0.5
-        float acc = 0;
-        for (int z = std::max(0, cz - 1); z <= std::min(gz - 1, cz + 1); z++)
-          for (int y = std::max(0, cy - 1); y <= std::min(gy - 1, cy + 1); y++)
-            for (int x = std::max(0, cx - 1); x <= std::min(gx - 1, cx + 1); x++) {
-              size_t c = ((size_t)z * gy + y) * gx + x;
-              for (uint32_t k = start[c]; k < start[c + 1]; k++) {
-                float d2 = length2(p - sp[k]);
-                if (d2 >= r2) continue;
-                if (dot(sn[k], n) < -0.05f) continue;  // other side of a thin wall
-                float w = 1.f - d2 / r2;
-                acc += w * w * sw[k];
-              }
-            }
-        float c = acc * norm * r * s.curvature_gain;
-        ss->curvature[i] = 0.5f + 0.5f * std::tanh(c);
+        float t, u, v;
+        uint32_t tri;
+        vec3 fn;
+        keep[i] = !(solid->intersect(es.p[i] + es.n[i] * lift, es.n[i], 0.f, 1e30f, t, tri, u, v) && face_n(tri, fn) && dot(fn, es.n[i]) > 0.f);
       }
     });
+    size_t k = 0;
+    for (size_t i = 0; i < keep.size(); i++) {
+      if (!keep[i]) continue;
+      es.p[k] = es.p[i];
+      es.n[k] = es.n[i];
+      es.w[k] = es.w[i];
+      es.shell[k] = es.shell[i];
+      k++;
+    }
+    es.p.resize(k);
+    es.n.resize(k);
+    es.w.resize(k);
+    es.shell.resize(k);
   }
+
+  // the samples in a grid of cells no smaller than the kernel
+  lo_ = m.bmin - vec3(r);
+  vec3 sz = m.bmax + vec3(r) - lo_;
+  cell_ = std::fmax(r, std::fmax(sz.x, std::fmax(sz.y, sz.z)) / 192.f);
+  gx_ = std::max(1, (int)std::ceil(sz.x / cell_));
+  gy_ = std::max(1, (int)std::ceil(sz.y / cell_));
+  gz_ = std::max(1, (int)std::ceil(sz.z / cell_));
+  size_t ncell = (size_t)gx_ * gy_ * gz_, n = es.w.size();
+  start_.assign(ncell + 1, 0);
+  std::vector<uint32_t> cell_id(n);
+  for (size_t i = 0; i < n; i++) {
+    int x, y, z;
+    cell_id[i] = (uint32_t)cell_of(es.p[i], x, y, z);
+    start_[cell_id[i] + 1]++;
+  }
+  for (size_t c = 0; c < ncell; c++) start_[c + 1] += start_[c];
+  sp_.resize(n);
+  sn_.resize(n);
+  sw_.resize(n);
+  shell_.resize(es.shell.size());
+  reach_.assign(ncell, 0);
+  std::vector<uint32_t> fill(start_.begin(), start_.end() - 1);
+  for (size_t i = 0; i < n; i++) {
+    uint32_t k = fill[cell_id[i]]++;
+    sp_[k] = es.p[i];
+    sn_[k] = es.n[i];
+    sw_[k] = es.w[i];
+    if (!shell_.empty()) shell_[k] = es.shell[i];
+    int cx = (int)(cell_id[i] % gx_), cy = (int)(cell_id[i] / gx_ % gy_), cz = (int)(cell_id[i] / ((size_t)gx_ * gy_));
+    for (int z = std::max(0, cz - 1); z <= std::min(gz_ - 1, cz + 1); z++)
+      for (int y = std::max(0, cy - 1); y <= std::min(gy_ - 1, cy + 1); y++)
+        for (int x = std::max(0, cx - 1); x <= std::min(gx_ - 1, cx + 1); x++) reach_[((size_t)z * gy_ + y) * gx_ + x] = 1;
+  }
+}
+
+float CurvatureField::at(vec3 p, vec3 n, float gain, uint32_t shell) const {
+  int cx, cy, cz;
+  if (reach_.empty() || !reach_[cell_of(p, cx, cy, cz)]) return 0.5f;  // flat
+  bool any_shell = shell == kAnyShell || shell_.empty();
+  float r2 = r_ * r_;
+  float acc = 0;
+  for (int z = std::max(0, cz - 1); z <= std::min(gz_ - 1, cz + 1); z++)
+    for (int y = std::max(0, cy - 1); y <= std::min(gy_ - 1, cy + 1); y++)
+      for (int x = std::max(0, cx - 1); x <= std::min(gx_ - 1, cx + 1); x++) {
+        size_t c = ((size_t)z * gy_ + y) * gx_ + x;
+        for (uint32_t k = start_[c]; k < start_[c + 1]; k++) {
+          float d2 = length2(p - sp_[k]);
+          if (d2 >= r2) continue;
+          if (dot(sn_[k], n) < -0.05f) continue;  // other side of a thin wall
+          if (!any_shell && shell_[k] != shell) continue;
+          float w = 1.f - d2 / r2;
+          acc += w * w * sw_[k];
+        }
+      }
+  float norm = 3.f / (kPi * r2);  // 1 / integral of (1-d^2/r^2)^2 over the disk
+  return 0.5f + 0.5f * std::tanh(acc * norm * r_ * gain);
 }
 
 // ---------------------------------------------------------------- disk cache
@@ -742,20 +828,18 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
   bool want_gpu = device == BakeDevice::Gpu || (device == BakeDevice::Auto && texels >= kGpuMinTexels && Gpu::enabled());
 
   // bump when baker output changes so stale disk caches are never reused
-  static const uint64_t kBakerVersion = 6;
+  static const uint64_t kBakerVersion = 7;
   uint64_t key = fnv1a(&kBakerVersion, sizeof kBakerVersion, m.content_hash ^ s.hash());
   for (int r : res_per_set) key = fnv1a(&r, sizeof r, key);
-  std::shared_ptr<Mesh> high;
-  if (!s.normal.high.empty()) {
-    high = std::make_shared<Mesh>(load_mesh(s.normal.high));
-    key = fnv1a(&high->content_hash, sizeof high->content_hash, key);
-  }
-  if (!s.normal.cage_mesh.empty()) {
+  // the high poly and the cage count by their file contents; the high poly itself is only loaded for a real bake
+  auto add_file = [&](const std::string& path, const char* what) {
     std::string bytes;
-    if (!read_file(s.normal.cage_mesh, bytes)) fail("cage mesh not found: '%s'", s.normal.cage_mesh.c_str());
+    if (!read_file(path, bytes)) fail("%s not found: '%s'", what, path.c_str());
     uint64_t h = fnv1a(bytes);
     key = fnv1a(&h, sizeof h, key);
-  }
+  };
+  if (!s.normal.high.empty()) add_file(s.normal.high, "mesh file");
+  if (!s.normal.cage_mesh.empty()) add_file(s.normal.cage_mesh, "cage mesh");
   // GPU and CPU bakes differ in the last float bits, so each device keeps its own cache entry. Either one
   // will do when it exists, and looking for the file first avoids starting the GPU just to find out.
   auto device_key = [&](bool on_gpu) { uint8_t d = on_gpu; return fnv1a(&d, 1, key); };
@@ -790,15 +874,25 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
   Gpu* gpu = nullptr;
   bool cached = !cached_file.empty() && load_cache(cached_file, bk->sets);
   if (!cached) {
+    std::shared_ptr<Mesh> high;
+    if (!s.normal.high.empty()) {
+      Timer t;
+      high = std::make_shared<Mesh>(load_mesh(s.normal.high, true));
+      stats.set("high_load_ms", t.ms());
+    }
     // curvature never touches the GPU, so it goes first: by now the driver is usually still starting
     auto bake_geometry = [&] {
       Timer t;
-      EdgeSamples es = curvature_edges(m, s.curvature_radius * m.max_extent(), s.curvature_min_angle);
-      std::vector<SampleSet*> ptrs;
-      for (auto& ss : bk->sets) ptrs.push_back(&ss);
-      bake_curvature(m, es, ptrs, s);
+      CurvatureField field;
+      field.build(m, s.curvature_radius * m.max_extent(), s.curvature_min_angle);
+      for (auto& ss : bk->sets) {
+        ss.curvature.resize(ss.size());
+        parallel_for((int64_t)ss.size(), 256, [&](int64_t b, int64_t e) {
+          for (int64_t i = b; i < e; i++) ss.curvature[i] = field.at(ss.pos[i], ss.nrm[i], s.curvature_gain);
+        });
+      }
       stats.set("curvature_ms", t.ms());
-      stats.set("curvature_edge_samples", (int64_t)es.p.size());
+      stats.set("curvature_edge_samples", (int64_t)field.sample_count());
     };
     auto bake_traced = [&](Gpu* on) {
       GpuScene low;
@@ -825,7 +919,7 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
       if (device == BakeDevice::Gpu) throw;
       stats.set("gpu_error", e.what());
       gpu = nullptr;
-      bake_geometry();  // the normal bake had started adding to the curvature
+      bake_geometry();  // the normal bake had started on the curvature
       bake_traced(nullptr);
     }
     on_gpu = gpu != nullptr;

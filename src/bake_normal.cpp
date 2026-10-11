@@ -16,8 +16,11 @@
 // on all cores.
 //
 // Results are denoised with an edge-avoiding a-trous filter in UV space (guided by 3D position and
-// normal, so nothing blurs across seams or islands), encoded in the low's MikkTSpace basis, and turned
-// into extra curvature so edge wear follows baked edges.
+// normal, so nothing blurs across seams or islands) and encoded in the low's MikkTSpace basis.
+//
+// Mesh maps: with a high poly, AO, thickness and curvature are measured where each texel lands on the
+// high-poly surface (as Toolbag bakes them), so masks follow its bevels, bolts and creases instead of the low
+// poly's edges. Without one, the bevelled normal is turned into extra curvature so edge wear follows it.
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -51,6 +54,7 @@ void NormalBakeSettings::from_json(const Json& j) {
   curvature = std::clamp(j.numf("curvature", curvature), 0.f, 10.f);
   cage_mesh = j.str("cage_mesh", cage_mesh);
   ao_from_high = j.boolean("ao_from_high", ao_from_high);
+  curvature_from_high = j.boolean("curvature_from_high", curvature_from_high);
   auto masked = [](const Json* m, const char* key, Json& mask, float& to, float lo, float hi) {
     if (!m) return;
     if (!m->is_object() || !m->has("mask")) fail("bake.normal.%s must be {\"to\": value, \"mask\": [effects...]}", key);
@@ -85,6 +89,7 @@ Json NormalBakeSettings::to_json() const {
   j.set("curvature", curvature);
   j.set("cage_mesh", cage_mesh);
   j.set("ao_from_high", ao_from_high);
+  j.set("curvature_from_high", curvature_from_high);
   if (!cage_mask.is_null()) { Json m = Json::object(); m.set("to", cage_to); m.set("mask", cage_mask); j.set("cage_mask", m); }
   if (!skew_mask.is_null()) { Json m = Json::object(); m.set("to", skew_to); m.set("mask", skew_mask); j.set("skew_mask", m); }
   Json b = Json::object();
@@ -141,12 +146,11 @@ std::string match_name(std::string s) {
 // A BVH over a subset of a mesh's triangles, reporting original triangle ids.
 struct SubBVH {
   BVH bvh;
-  std::vector<uint32_t> tri;  // local -> original triangle
-  void build(const Mesh& m, const std::vector<uint32_t>& tris) {
-    tri = tris;
+  std::vector<uint32_t> tri;  // local -> original triangle, ascending
+  void build(const Mesh& m) {
     std::vector<uint32_t> idx;
-    idx.reserve(tris.size() * 3);
-    for (uint32_t t : tris) for (int k = 0; k < 3; k++) idx.push_back(m.idx[t * 3 + k]);
+    idx.reserve(tri.size() * 3);
+    for (uint32_t t : tri) for (int k = 0; k < 3; k++) idx.push_back(m.idx[t * 3 + k]);
     if (!idx.empty()) bvh.build(m.pos, idx);
   }
   bool hit(vec3 o, vec3 d, float tmin, float tmax, float& t, uint32_t& orig, float& u, float& v, BVH::Facing facing = BVH::kAny) const {
@@ -156,6 +160,25 @@ struct SubBVH {
     orig = tri[local];
     return true;
   }
+};
+
+// The BVHs one bake traces, each over some of a mesh's triangles. Bake groups, the bevel's scopes and the whole
+// mesh are often the same triangles (a part per group, or one group for everything): those share one BVH, and
+// all of them are built at the same time.
+struct BvhSet {
+  std::vector<SubBVH> list;
+  int add(std::vector<uint32_t> tris) {  // ascending triangle ids; returns the index of their BVH
+    for (size_t k = 0; k < list.size(); k++) if (list[k].tri == tris) return (int)k;
+    list.emplace_back();
+    list.back().tri = std::move(tris);
+    return (int)list.size() - 1;
+  }
+  void build(const Mesh& m) {
+    parallel_for((int64_t)list.size(), 1, [&](int64_t b, int64_t e) {
+      for (int64_t k = b; k < e; k++) list[k].build(m);
+    });
+  }
+  const SubBVH& operator[](int k) const { return list[k]; }
 };
 
 // Uniform grid of segments for "distance to the nearest edge" queries within `radius`.
@@ -377,24 +400,34 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     feat_low.build(R);
   }
 
-  // high-poly groups: low part -> BVH of matching high parts
-  std::vector<SubBVH> groups;
-  std::vector<int> low_group(low.part_names.size(), -1);
+  // Mesh maps on the high poly. For AO and thickness the whole high mesh occludes (parts ground each other,
+  // like Toolbag's ignore groups); curvature is that of the piece of surface a texel lands on.
+  bool ao_high = high && s.ao_from_high, curvature_high = high && s.curvature_from_high;
+  bool maps_high = ao_high || curvature_high;
+
+  // The BVHs: over the high poly when there is one (bake groups, bevel scopes, the whole mesh for its maps),
+  // otherwise over the low (bevel scopes).
+  const Mesh& traced = high ? *high : low;
+  BvhSet bvhs;
+  std::vector<int> low_group(low.part_names.size(), -1);  // low part -> BVH of the matching high parts
+  std::vector<int> part_bvh;                              // part of the traced mesh -> BVH its bevel rounds against
+  int whole = -1;                                         // BVH of every triangle of the traced mesh
+  auto get_whole = [&]() {
+    if (whole < 0) {
+      std::vector<uint32_t> all(traced.tri_count());
+      for (uint32_t t = 0; t < all.size(); t++) all[t] = t;
+      whole = bvhs.add(std::move(all));
+    }
+    return whole;
+  };
+  std::vector<std::vector<uint32_t>> tris_of_part(traced.part_names.size());
+  for (uint32_t t = 0; t < traced.tri_count(); t++) tris_of_part[traced.tri_part[t]].push_back(t);
   Json gj = Json::array();
   std::vector<std::string> warnings;
   std::vector<uint32_t> weld_high;
   EdgeGrid feat_high;
   if (high) {
-    std::vector<std::vector<uint32_t>> high_tris_of_part(high->part_names.size());
-    for (uint32_t t = 0; t < high->tri_count(); t++) high_tris_of_part[high->tri_part[t]].push_back(t);
     std::vector<uint8_t> high_used(high->part_names.size(), 0);
-    std::vector<uint32_t> all;
-    for (uint32_t t = 0; t < high->tri_count(); t++) all.push_back(t);
-    int all_group = -1;
-    auto get_all = [&]() {
-      if (all_group < 0) { groups.emplace_back(); groups.back().build(*high, all); all_group = (int)groups.size() - 1; }
-      return all_group;
-    };
     for (size_t lp = 0; lp < low.part_names.size(); lp++) {
       Json g = Json::object();
       g.set("low", low.part_names[lp]);
@@ -404,101 +437,90 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         std::vector<uint32_t> tris;
         for (size_t hp = 0; hp < high->part_names.size(); hp++)
           if (match_name(high->part_names[hp]) == base) {
-            tris.insert(tris.end(), high_tris_of_part[hp].begin(), high_tris_of_part[hp].end());
+            tris.insert(tris.end(), tris_of_part[hp].begin(), tris_of_part[hp].end());
             high_used[hp] = 1;
             hs.push(high->part_names[hp]);
           }
         if (!tris.empty()) {
-          groups.emplace_back();
-          groups.back().build(*high, tris);
-          low_group[lp] = (int)groups.size() - 1;
+          std::sort(tris.begin(), tris.end());
+          low_group[lp] = bvhs.add(std::move(tris));
         } else {
-          low_group[lp] = get_all();
+          low_group[lp] = get_whole();
           hs.push("*");
           warnings.push_back("low part '" + low.part_names[lp] + "' has no matching high part (name it '" + base +
                              "_high'); it bakes against the whole high mesh");
         }
       } else {
-        low_group[lp] = get_all();
+        low_group[lp] = get_whole();
         hs.push("*");
       }
       g.set("high", hs);
       gj.push(g);
     }
-    if (s.match == "name")
+    if (s.match == "name" && whole < 0)  // no low part bakes against the whole mesh
       for (size_t hp = 0; hp < high->part_names.size(); hp++)
-        if (!high_used[hp] && all_group < 0) warnings.push_back("high part '" + high->part_names[hp] + "' matches no low part and is ignored");
+        if (!high_used[hp]) warnings.push_back("high part '" + high->part_names[hp] + "' matches no low part and is ignored");
     if (R > 0) {
       weld_high = weld_by_position(*high, nullptr);
       feature_edges(*high, weld_high, s.bevel_min_angle, false, feat_high);
       feat_high.build(R);
     }
   }
-  // per-part BVHs for the bevel shader
-  const Mesh& bev_mesh = high ? *high : low;
-  std::vector<SubBVH> part_bvh;
-  SubBVH whole_bvh;
-  if (R > 0) {
-    if (s.bevel_same_part) {
-      std::vector<std::vector<uint32_t>> tris(bev_mesh.part_names.size());
-      for (uint32_t t = 0; t < bev_mesh.tri_count(); t++) tris[bev_mesh.tri_part[t]].push_back(t);
-      part_bvh.resize(tris.size());
-      for (size_t k = 0; k < tris.size(); k++) part_bvh[k].build(bev_mesh, tris[k]);
-    } else {
-      std::vector<uint32_t> all;
-      for (uint32_t t = 0; t < bev_mesh.tri_count(); t++) all.push_back(t);
-      whole_bvh.build(bev_mesh, all);
-    }
+  if (R > 0) {  // the bevel shader stays within a part, or sees the whole mesh
+    if (s.bevel_same_part) for (auto& tris : tris_of_part) part_bvh.push_back(bvhs.add(tris));
+    else get_whole();
   }
+  if (maps_high) get_whole();
+  {
+    Timer t;
+    bvhs.build(traced);
+    st.set("bvh_ms", t.ms());
+  }
+  auto bevel_bvh = [&](uint32_t tri) { return s.bevel_same_part ? part_bvh[traced.tri_part[tri]] : whole; };
   auto bevel_at = [&](vec3 p, uint32_t tri, vec3 shading, uint32_t seed) {
     const EdgeGrid& fg = high ? feat_high : feat_low;
     if (fg.distance(p) >= R) return shading;  // nothing to round within reach
-    const SubBVH& b = s.bevel_same_part ? part_bvh[bev_mesh.tri_part[tri]] : whole_bvh;
-    return bevel_normal(bev_mesh, b, p, tri_normal(bev_mesh, tri), shading, R, s.bevel_samples, seed);
+    return bevel_normal(traced, bvhs[bevel_bvh(tri)], p, tri_normal(traced, tri), shading, R, s.bevel_samples, seed);
   };
 
   // explicit cage: same triangles as the low (e.g. a pushed copy exported from the DCC)
   std::unique_ptr<Mesh> cage_m;
   if (!s.cage_mesh.empty() && high) {
-    cage_m = std::make_unique<Mesh>(load_mesh(s.cage_mesh));
+    cage_m = std::make_unique<Mesh>(load_mesh(s.cage_mesh, true));
     if (cage_m->tri_count() != low.tri_count())
       fail("cage mesh '%s' has %zu triangles but the low poly has %zu: export the cage as a pushed copy of the low (same topology)",
            s.cage_mesh.c_str(), cage_m->tri_count(), low.tri_count());
   }
-  // AO from the high poly: the whole high mesh occludes (parts ground each other, like Toolbag's ignore groups)
-  SubBVH high_all;
-  bool ao_high = high && s.ao_from_high;
-  if (ao_high) {
-    std::vector<uint32_t> all;
-    for (uint32_t t = 0; t < high->tri_count(); t++) all.push_back(t);
-    high_all.build(*high, all);
+  CurvatureField high_curvature;
+  if (curvature_high) {
+    // every edge counts: on a dense mesh the many slight ones add up to its curvature
+    Timer t;
+    high_curvature.build(*high, bs.curvature_radius * ext, 0.f, &bvhs[whole].bvh);
+    st.set("curvature_edge_samples", (int64_t)high_curvature.sample_count());
+    st.set("curvature_ms", t.ms());
   }
 
   int grid = std::max(1, (int)std::lround(std::sqrt((float)s.samples)));
 
-  // On the GPU: every BVH above in one scene (bake groups first, so a group's index is its BVH index), the
-  // traced mesh's normals, and the feature edges the projection kernel rounds against.
+  // On the GPU: the BVHs in one scene (a BVH's index there is its index in `bvhs`), the traced mesh's normals,
+  // and the feature edges the projection kernel rounds against.
   GpuScene scene;
-  std::vector<uint32_t> bevel_bvh;  // part of the bevelled mesh -> scene BVH
-  uint32_t whole_gpu = 0, high_all_gpu = 0;
   GpuParams edge_params;
   if (gpu) {
-    for (auto& g : groups) scene.add(g.bvh, &g.tri);
-    for (auto& b : part_bvh) bevel_bvh.push_back(scene.add(b.bvh, &b.tri));
-    if (R > 0 && !s.bevel_same_part) whole_gpu = scene.add(whole_bvh.bvh, &whole_bvh.tri);
-    if (ao_high) high_all_gpu = scene.add(high_all.bvh, &high_all.tri);
+    for (auto& b : bvhs.list) scene.add(b.bvh, &b.tri);
     scene.upload(*gpu);
-    std::vector<GpuTriAttr> attr(bev_mesh.tri_count());
+    std::vector<GpuTriAttr> attr(traced.tri_count());
     parallel_for((int64_t)attr.size(), [&](int64_t b, int64_t e) {
       for (int64_t t = b; t < e; t++) {
-        uint32_t bb = R > 0 ? (s.bevel_same_part ? bevel_bvh[bev_mesh.tri_part[t]] : whole_gpu) : 0;
-        attr[t] = {bev_mesh.nrm[bev_mesh.idx[t * 3]], bb, bev_mesh.nrm[bev_mesh.idx[t * 3 + 1]], 0, bev_mesh.nrm[bev_mesh.idx[t * 3 + 2]], 0};
+        uint32_t bb = R > 0 ? (uint32_t)bevel_bvh((uint32_t)t) : 0;
+        attr[t] = {traced.nrm[traced.idx[t * 3]], bb, traced.nrm[traced.idx[t * 3 + 1]], 0, traced.nrm[traced.idx[t * 3 + 2]], 0};
       }
     });
     scene.attr = gpu->upload(attr.data(), attr.size(), sizeof(GpuTriAttr));
     if (R > 0 && high) upload_edges(*gpu, feat_high, scene, edge_params);
   }
 
+  double project_ms = 0, maps_ms = 0;
   int64_t misses_total = 0, samples_total = 0;
   Json sets_j = Json::object();
   for (auto& ss : sets) {
@@ -510,10 +532,12 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     std::vector<float> cage_k, skew_k;  // painted cage / skew (mask stacks evaluated on this set's samples)
     if (high && !s.cage_mask.is_null()) cage_k = evaluate_mask(s.cage_mask, bk, ss.set, s.base_dir, &warnings);
     if (high && !s.skew_mask.is_null()) skew_k = evaluate_mask(s.skew_mask, bk, ss.set, s.base_dir, &warnings);
-    std::vector<vec3> hit_p, hit_n;  // centre hit on the high poly (for AO)
+    std::vector<vec3> hit_p;  // where each texel lands on the high poly (for its mesh maps)
+    std::vector<uint32_t> hit_tri;
     std::vector<uint8_t> hit_ok;
-    if (ao_high) { hit_p.assign(n, vec3(0.f)); hit_n.assign(n, vec3(0.f)); hit_ok.assign(n, 0); }
+    if (maps_high) { hit_p.assign(n, vec3(0.f)); hit_tri.assign(n, 0); hit_ok.assign(n, 0); }
     auto sample_seed = [&](size_t i) { return hash_u32((uint32_t)ss.texel[i] * 2654435761u + (uint32_t)ss.set * 97u); };
+    Timer stage;
     if (high) {
       // auto: at hard edges dir == nc on both sides, so starting along dir is gap-free and never shifts
       // details sideways; a fixed skew starts on the continuous cage (Toolbag) so edges stay closed
@@ -552,7 +576,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
       // CPU estimator, mirrored by the project kernel in shaders/bake.hlsl
       auto project = [&](const GpuProjIn& in) {
         GpuProjOut r{};
-        const SubBVH& g = groups[in.group];
+        const SubBVH& g = bvhs[(int)in.group];
         vec3 acc{0, 0, 0};
         int miss = 0;
         for (int sy = 0; sy < grid; sy++)
@@ -581,10 +605,10 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
             }
             if (found) {
               nh = smooth_normal(*high, ht, u, v);
-              if (ao_high && sx == grid / 2 && sy == grid / 2) {
-                vec3 hg = tri_normal(*high, ht);
+              // the centre supersample's hit, or another one's when it misses
+              if (maps_high && ((sx == grid / 2 && sy == grid / 2) || !(r.flags & kGpuOutHit))) {
                 r.hit_p = o - in.dir * th;
-                r.hit_n = dot(hg, nh) < 0 ? -hg : hg;
+                r.hit_tri = ht;
                 r.flags |= kGpuOutHit;
               }
               if (R > 0) {
@@ -606,7 +630,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         world[i] = r.n;
         ss.nmiss[i] = (r.flags & kGpuOutMiss) != 0;
         denoise_mask[i] = (r.flags & kGpuOutBevel) != 0;
-        if (ao_high) { hit_p[i] = r.hit_p; hit_n[i] = r.hit_n; hit_ok[i] = (r.flags & kGpuOutHit) != 0; }
+        if (maps_high) { hit_p[i] = r.hit_p; hit_tri[i] = r.hit_tri; hit_ok[i] = (r.flags & kGpuOutHit) != 0; }
       };
       if (gpu) {
         GpuParams p = edge_params;
@@ -615,7 +639,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         p.grid = (uint32_t)grid;
         p.depth = depth;
         p.bevel_r = R;
-        p.flags = (start_on_dir ? kGpuAutoSkew : 0) | (cage_m ? kGpuCageMesh : 0) | (s.ignore_backfaces ? kGpuBackfaces : 0) | (ao_high ? kGpuAoHigh : 0);
+        p.flags = (start_on_dir ? kGpuAutoSkew : 0) | (cage_m ? kGpuCageMesh : 0) | (s.ignore_backfaces ? kGpuBackfaces : 0) | (maps_high ? kGpuHit : 0);
         // The bevel costs hundreds of rays where a hit is near a feature edge and nothing elsewhere. A first pass
         // projects every texel and reports the ones near an edge; a second pass bevels only those, so the
         // threads of a dispatch do similar amounts of work.
@@ -664,7 +688,6 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
       });
       std::vector<uint32_t> edge_ids;
       for (size_t i = 0; i < n; i++) if (denoise_mask[i]) edge_ids.push_back((uint32_t)i);
-      auto bevel_bvh_of = [&](uint32_t t) -> const SubBVH& { return s.bevel_same_part ? part_bvh[low.tri_part[t]] : whole_bvh; };
       if (gpu) {
         GpuParams p;
         p.samples = (uint32_t)s.bevel_samples;
@@ -674,8 +697,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
                   parallel_for((int64_t)count, 1024, [&](int64_t b, int64_t e) {
                     for (int64_t j = b; j < e; j++) {
                       uint32_t i = edge_ids[first + j], t = ss.tri[i];
-                      uint32_t bb = s.bevel_same_part ? bevel_bvh[low.tri_part[t]] : whole_gpu;
-                      ((GpuBevelIn*)dst)[j] = {ss.pos[i], sample_seed(i), normalize(ss.nrm[i]), bb, tri_normal(low, t), 0.f};
+                      ((GpuBevelIn*)dst)[j] = {ss.pos[i], sample_seed(i), normalize(ss.nrm[i]), (uint32_t)bevel_bvh(t), tri_normal(low, t), 0.f};
                     }
                   });
                 },
@@ -687,7 +709,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         parallel_for((int64_t)edge_ids.size(), 16, [&](int64_t b, int64_t e) {
           for (int64_t j = b; j < e; j++) {
             uint32_t i = edge_ids[j], t = ss.tri[i];
-            world[i] = normalize(bevel_normal(low, bevel_bvh_of(t), ss.pos[i], tri_normal(low, t), normalize(ss.nrm[i]), R, s.bevel_samples, sample_seed(i)));
+            world[i] = normalize(bevel_normal(low, bvhs[bevel_bvh(t)], ss.pos[i], tri_normal(low, t), normalize(ss.nrm[i]), R, s.bevel_samples, sample_seed(i)));
           }
         });
       }
@@ -715,50 +737,39 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         ss.nmap[i] = normalize(nt);
       }
     });
-    if (ao_high) {
-      float maxd = bs.ao_distance * ext, aeps = ext * 2e-5f;
-      int N = bs.ao_samples;
-      auto scramble = [&](size_t i) { return hash_u32((uint32_t)ss.texel[i] * 747796405u + 11u); };
-      if (gpu) {
-        std::vector<uint32_t> ids;
-        for (size_t i = 0; i < n; i++) if (hit_ok[i]) ids.push_back((uint32_t)i);
-        GpuParams p;
-        p.samples = (uint32_t)N;
-        p.maxd = maxd;
-        p.eps = aeps;
-        p.bvh = high_all_gpu;
-        gpu_run(*gpu, GpuKernel::AoHigh, p, scene, ids.size(), sizeof(GpuHit), sizeof(uint32_t), (uint64_t)N,
-                [&](size_t first, size_t count, void* dst) {
-                  parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
-                    for (int64_t j = b; j < e; j++) {
-                      uint32_t i = ids[first + j];
-                      ((GpuHit*)dst)[j] = {hit_p[i], scramble(i), hit_n[i], 0.f};
-                    }
-                  });
-                },
-                [&](size_t first, size_t count, const void* src) {
-                  for (size_t j = 0; j < count; j++) ss.ao[ids[first + j]] = 1.f - (float)((const uint32_t*)src)[j] / N;
-                });
-      } else {
-        // mirrored by the AO-from-high kernel in shaders/bake.hlsl
-        parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
-          for (int64_t i = b; i < e; i++) {
-            if (!hit_ok[i]) continue;
-            vec3 hn = hit_n[i], o = hit_p[i] + hn * aeps, T, B;
-            onb(hn, T, B);
-            uint32_t scr = scramble((size_t)i);
-            int hits = 0;
-            for (int k = 0; k < N; k++) {
-              vec2 xi = hammersley2((uint32_t)k, (uint32_t)N, scr);
-              float r = std::sqrt(xi.x), phi = 2.f * kPi * xi.y;
-              vec3 d = T * (r * std::cos(phi)) + B * (r * std::sin(phi)) + hn * std::sqrt(std::fmax(0.f, 1.f - xi.x));
-              if (high_all.bvh.occluded(o, d, 0.f, maxd)) hits++;
-            }
-            ss.ao[i] = 1.f - (float)hits / N;
+    project_ms += stage.ms();
+    if (maps_high) {
+      stage = Timer();
+      std::vector<uint32_t> ids;
+      for (size_t i = 0; i < n; i++) if (hit_ok[i]) ids.push_back((uint32_t)i);
+      // the high poly's smooth normal there, and its geometric normal on the same side
+      std::vector<vec3> hit_ns(ids.size()), hit_ng(ids.size());
+      parallel_for((int64_t)ids.size(), 1024, [&](int64_t b, int64_t e) {
+        for (int64_t j = b; j < e; j++) {
+          uint32_t i = ids[j], t = hit_tri[i];
+          vec3 bc = barycentric(*high, t, hit_p[i]), ng = tri_normal(*high, t);
+          hit_ns[j] = smooth_normal(*high, t, bc.y, bc.z);
+          hit_ng[j] = dot(ng, hit_ns[j]) < 0 ? -ng : ng;
+        }
+      });
+      if (ao_high) {
+        std::vector<float> ao(ids.size()), thickness(ids.size());
+        trace_ao_thickness(bvhs[whole].bvh, bs, ext, gpu, scene, (uint32_t)whole, ids.size(),
+                           [&](size_t j) { return GpuSample{hit_p[ids[j]], ids[j], hit_ns[j], 0.f, hit_ng[j], 0.f}; }, ao.data(), thickness.data());
+        parallel_for((int64_t)ids.size(), 4096, [&](int64_t b, int64_t e) {
+          for (int64_t j = b; j < e; j++) { ss.ao[ids[j]] = ao[j]; ss.thickness[ids[j]] = thickness[j]; }
+        });
+        denoise_samples(ss, ss.ao);
+        denoise_samples(ss, ss.thickness);
+      }
+      if (curvature_high)
+        parallel_for((int64_t)ids.size(), 256, [&](int64_t b, int64_t e) {
+          for (int64_t j = b; j < e; j++) {
+            uint32_t i = ids[j];
+            ss.curvature[i] = high_curvature.at(hit_p[i], hit_ns[j], bs.curvature_gain, high_curvature.tri_shell[hit_tri[i]]);
           }
         });
-      }
-      denoise_samples(ss, ss.ao);
+      maps_ms += stage.ms();
     }
     Json sj = Json::object();
     sj.set("misses", misses);
@@ -768,9 +779,10 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     samples_total += (int64_t)n;
   }
 
-  // curvature from the baked normals: divergence of the tangent-space normal over the curvature radius,
-  // added to the geometric curvature so edge wear and dirt follow baked edges and details
-  if (s.curvature > 0) {
+  // Curvature from the baked normals, when it is not that of a high poly already: divergence of the
+  // tangent-space normal over the curvature radius, added to the low poly's geometric curvature so edge wear
+  // and dirt follow the bevelled edges.
+  if (s.curvature > 0 && !curvature_high) {
     float rc = bs.curvature_radius * ext;
     for (auto& ss : sets) {
       int res = ss.res;
@@ -842,7 +854,10 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
   st.set("sets", sets_j);
   st.set("miss_fraction", samples_total ? (double)misses_total / samples_total : 0.0);
   if (high) st.set("groups", gj);
-  st.set("ao", ao_high ? "high" : "low");
+  st.set("ao", ao_high ? "high" : "low");  // which mesh AO and thickness describe
+  st.set("curvature", curvature_high ? "high" : "low");
+  st.set("project_ms", project_ms);  // projection (or the low-poly bevel), denoising and encoding
+  if (maps_high) st.set("maps_ms", maps_ms);
   if (cage_m) st.set("cage", "mesh");
   Json wj = Json::array();
   for (auto& w : warnings) wj.push(w);

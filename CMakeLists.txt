@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(patina VERSION 0.4.1 LANGUAGES C CXX)
+project(patina VERSION 0.4.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,7 +76,7 @@ if(WIN32)
 endif()
 if(WIN32 AND PATINA_FXC)
   target_sources(patina_core PRIVATE src/gpu_d3d11.cpp)
-  foreach(kernel surface ao_high project bevel)
+  foreach(kernel surface project bevel)
     string(TOUPPER ${kernel} KERNEL)
     set(out ${CMAKE_BINARY_DIR}/generated/bake_${kernel}.h)
     add_custom_command(OUTPUT ${out}

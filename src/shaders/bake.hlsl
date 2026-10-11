@@ -14,7 +14,7 @@ cbuffer Params : register(b0) {
   uint g_samples;       // AO rays per sample, or bevel samples
   float g_maxd;         // AO ray length
   float g_eps;
-  uint g_bvh;           // BVH traced by the surface and AO-from-high kernels
+  uint g_bvh;           // BVH traced by the surface kernel
   uint g_grid;          // project: supersamples per axis
   uint g_flags;
   float g_depth;        // project: how far inside the low surface rays still look
@@ -29,7 +29,7 @@ cbuffer Params : register(b0) {
 #define F_AUTO_SKEW 1u     // rays start along their own direction (auto skew without a painted skew)
 #define F_CAGE_MESH 2u     // rays start on an explicit cage
 #define F_BACKFACES 4u     // skip high-poly backfaces
-#define F_AO_HIGH 8u       // report the centre hit (AO is traced from it afterwards)
+#define F_HIT 8u           // report where the texel lands on the high poly (its mesh maps are measured there)
 #define F_BEVEL_DETECT 16u // only report which samples reach a feature edge; the bevel itself runs in a second pass
 
 struct Node { float3 bmin; uint left_first; float3 bmax; uint count; };  // BVH::Node
@@ -193,7 +193,7 @@ bool intersect(Bvh b, float3 o, float3 d, float tmin, float tmax, int facing, ou
   return found;
 }
 
-// ---------------------------------------------------------------- bake.cpp: AO and thickness on the low poly
+// ---------------------------------------------------------------- bake.cpp: AO and thickness of a surface
 #ifdef KERNEL_SURFACE
 struct SampleIn { float3 pos; uint seed; float3 nrm; float pad0; float3 fnrm; float pad1; };  // GpuSample
 struct SurfaceOut { uint ao; float thickness; };  // hits << 16 | valid rays; summed distance through the mesh
@@ -251,31 +251,6 @@ void main(uint3 id : SV_DispatchThreadID) {
   r.ao = ao_rays(s, bvh);
   r.thickness = thickness_rays(s, bvh);
   g_out[i] = r;
-}
-#endif
-
-// ---------------------------------------------------------------- bake_normal.cpp: AO from the high poly
-#ifdef KERNEL_AO_HIGH
-struct HitIn { float3 p; uint scramble; float3 n; float pad; };  // GpuHit
-StructuredBuffer<HitIn> g_in : register(t8);
-RWStructuredBuffer<uint> g_out : register(u0);  // occluded rays
-
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-  uint i = id.x;
-  if (i >= g_count) return;
-  HitIn s = g_in[i];
-  Bvh bvh = g_bvhs[g_bvh];
-  float3 hn = s.n, o = s.p + hn * g_eps, T, B;
-  onb(hn, T, B);
-  uint hits = 0;
-  [loop] for (uint k = 0; k < g_samples; k++) {
-    float2 xi = hammersley2(k, g_samples, s.scramble);
-    float r = sqrt(xi.x), phi = 2.0 * kPi * xi.y;
-    float3 d = T * (r * cos(phi)) + B * (r * sin(phi)) + hn * sqrt(max(0.0, 1.0 - xi.x));
-    if (occluded(bvh, o, d, 0.0, g_maxd, ANY)) hits++;
-  }
-  g_out[i] = hits;
 }
 #endif
 
@@ -389,10 +364,10 @@ struct ProjIn {  // GpuProjIn
   float3 dir; float pad0;   // rays travel along -dir
   float3 pc; float pad1;    // point on the explicit cage
 };
-struct ProjOut { float3 n; uint flags; float3 hit_p; float pad0; float3 hit_n; float pad1; };  // GpuProjOut
+struct ProjOut { float3 n; uint flags; float3 hit_p; uint hit_tri; };  // GpuProjOut
 #define O_MISS 1u    // most supersamples found no high-poly surface
 #define O_BEVEL 2u   // the bevel shader changed the normal
-#define O_HIT 4u     // hit_p / hit_n hold the centre hit
+#define O_HIT 4u     // hit_p / hit_tri hold where the texel lands on the high poly
 #define O_NEAR 8u    // F_BEVEL_DETECT: a hit lies within bevel reach of a feature edge
 StructuredBuffer<ProjIn> g_in : register(t8);
 RWStructuredBuffer<ProjOut> g_out : register(u0);
@@ -406,7 +381,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   uint grid = g_grid;
   float3 acc = float3(0, 0, 0);
   uint miss = 0, flags = 0;
-  float3 hit_p = float3(0, 0, 0), hit_n = float3(0, 0, 0);
+  float3 hit_p = float3(0, 0, 0);
+  uint hit_tri = 0;
   [loop] for (uint sy = 0; sy < grid; sy++)
     [loop] for (uint sx = 0; sx < grid; sx++) {
       float ox = ((float)sx + 0.5) / (float)grid - 0.5, oy = ((float)sy + 0.5) / (float)grid - 0.5;
@@ -432,9 +408,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint orig = g_tri_orig[ref];
         nh = smooth_normal(g_attr[orig], u, v);
         float3 hp = o - s.dir * th;
-        if ((g_flags & F_AO_HIGH) && sx == grid / 2 && sy == grid / 2) {
+        // the centre supersample's hit, or another one's when it misses
+        if ((g_flags & F_HIT) && ((sx == grid / 2 && sy == grid / 2) || !(flags & O_HIT))) {
           hit_p = hp;
-          hit_n = dot(hg, nh) < 0.0 ? -hg : hg;
+          hit_tri = orig;
           flags |= O_HIT;
         }
         if (g_bevel_r > 0.0 && edge_distance(hp) < g_bevel_r) {
@@ -454,9 +431,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   r.n = nrmz(acc);
   r.flags = flags;
   r.hit_p = hit_p;
-  r.pad0 = 0;
-  r.hit_n = hit_n;
-  r.pad1 = 0;
+  r.hit_tri = hit_tri;
   g_out[i] = r;
 }
 #endif

@@ -22,6 +22,8 @@ Items marked *(unverified)* came from third-party sources or convention, not off
   - AO and thickness, ray traced with a BVH.
   - Curvature, from an edge integral over dihedral angles.
   - Position, normals and UV islands, taken straight from the surface samples.
+- Toolbag isolates the projection per bake group but, with Ignore Groups, lets the other groups occlude in the AO and thickness passes ([bake groups](https://docs.marmoset.co/?p=1357), [Polycount](https://polycount.com/discussion/comment/2594939/)). Its surface maps describe the high poly *(from use; the map table in its docs did not load, unverified)*.
+- **Patina with a high poly:** AO, thickness and curvature are measured where each texel lands on the high poly. The whole high mesh occludes; curvature is the edge integral over the piece of high-poly surface that was hit, without edges buried in another piece.
 
 **GPU baking**
 - Painter added GPU raytracing for the AO and thickness bakers in 2019.2: DXR when available, otherwise OptiX. It can be turned off in the baking options, which is also the advice when a high poly does not fit in video memory and the bake fails ([2019.2 notes](https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/release-notes/old-versions/version-2019-2)). Adobe puts the gain at 25x or more ([GPU raytracing](https://helpx.adobe.com/substance-3d-bake/features/gpu-raytracing.html), *unverified*: the page did not load, the figure is from a search summary).

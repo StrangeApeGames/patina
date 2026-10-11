@@ -14,7 +14,7 @@ struct GpuError : Error {
   using Error::Error;
 };
 
-enum class GpuKernel { Surface, AoHigh, Project, Bevel, Count };
+enum class GpuKernel { Surface, Project, Bevel, Count };
 
 class Gpu {
  public:

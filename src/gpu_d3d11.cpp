@@ -19,14 +19,12 @@ namespace {
 
 // src/shaders/bake.hlsl, one header per kernel (CMakeLists.txt)
 #include "bake_surface.h"
-#include "bake_ao_high.h"
 #include "bake_project.h"
 #include "bake_bevel.h"
 
 struct Bytecode { const BYTE* data; size_t size; };
 const Bytecode kKernels[(int)GpuKernel::Count] = {
-    {g_bake_surface, sizeof g_bake_surface}, {g_bake_ao_high, sizeof g_bake_ao_high},
-    {g_bake_project, sizeof g_bake_project}, {g_bake_bevel, sizeof g_bake_bevel},
+    {g_bake_surface, sizeof g_bake_surface}, {g_bake_project, sizeof g_bake_project}, {g_bake_bevel, sizeof g_bake_bevel},
 };
 
 template <class T>

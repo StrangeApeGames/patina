@@ -15,7 +15,7 @@ struct GpuParams {
   uint32_t samples = 0;  // AO rays per sample, or bevel samples
   float maxd = 0;        // AO ray length
   float eps = 0;
-  uint32_t bvh = 0;      // BVH traced by the surface and AO-from-high kernels
+  uint32_t bvh = 0;      // BVH traced by the surface kernel
   uint32_t grid = 1;     // project: supersamples per axis
   uint32_t flags = 0;    // kGpu* below
   float depth = 0;
@@ -27,11 +27,11 @@ struct GpuParams {
   float thickness_maxd = 0;
   uint32_t pad[2] = {};
 };
-enum : uint32_t { kGpuAutoSkew = 1, kGpuCageMesh = 2, kGpuBackfaces = 4, kGpuAoHigh = 8, kGpuBevelDetect = 16 };
+enum : uint32_t { kGpuAutoSkew = 1, kGpuCageMesh = 2, kGpuBackfaces = 4, kGpuHit = 8, kGpuBevelDetect = 16 };
 
-struct GpuSample { vec3 pos; uint32_t seed; vec3 nrm; float pad0; vec3 fnrm; float pad1; };  // AO and thickness in
-struct GpuSurfaceOut { uint32_t ao; float thickness; };                                       // ... and out
-struct GpuHit { vec3 p; uint32_t scramble; vec3 n; float pad; };                             // AO from the high poly
+// AO and thickness in (a point of the traced surface: smooth normal, geometric normal on the same side) ...
+struct GpuSample { vec3 pos; uint32_t seed; vec3 nrm; float pad0; vec3 fnrm; float pad1; };
+struct GpuSurfaceOut { uint32_t ao; float thickness; };  // ... and out
 struct GpuBevelIn { vec3 pos; uint32_t seed; vec3 ns; uint32_t bvh; vec3 ng; float pad; };
 struct GpuProjIn {
   vec3 pos; uint32_t seed;
@@ -42,7 +42,7 @@ struct GpuProjIn {
   vec3 dir; float pad0;
   vec3 pc; float pad1;
 };
-struct GpuProjOut { vec3 n; uint32_t flags; vec3 hit_p; float pad0; vec3 hit_n; float pad1; };
+struct GpuProjOut { vec3 n; uint32_t flags; vec3 hit_p; uint32_t hit_tri; };  // hit_*: where the texel lands on the high poly
 enum : uint32_t { kGpuOutMiss = 1, kGpuOutBevel = 2, kGpuOutHit = 4, kGpuOutNear = 8 };
 struct GpuTriAttr { vec3 n0; uint32_t bevel_bvh; vec3 n1; uint32_t pad1; vec3 n2; uint32_t pad2; };
 struct GpuEdgeCell { uint32_t key_lo, key_hi, start, count; };
