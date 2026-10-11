@@ -1,7 +1,7 @@
 // Install, self-update and the agent skills.
 //
 // Shared code: this file and selfupdate.cpp are identical in Patina (github.com/parodyband/patina) and Chisel
-// (github.com/parodyband/sdf-sandbox), so change both copies together. What differs between the tools is in each
+// (github.com/parodyband/chisel), so change both copies together. What differs between the tools is in each
 // one's tool.cpp.
 #pragma once
 #include <string>
