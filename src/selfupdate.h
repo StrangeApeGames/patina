@@ -15,7 +15,7 @@ struct ToolInfo {
   const char* title;    // "Patina"
   const char* version;
   const char* repo;     // GitHub "owner/repo" whose releases carry the binaries and SHA256SUMS.txt
-  const char* env;      // "PATINA": prefix of <env>_HOME, _NO_UPDATE_CHECK, _NO_AUTO_UPDATE and _RELEASES_API
+  const char* env;      // "PATINA": prefix of <env>_HOME, <env>_NO_UPDATE_CHECK and <env>_RELEASES_API
   const char* asset_windows_x64;  // release asset per platform, "" where there is no build
   const char* asset_macos_arm64;
   const char* skill_description;  // SKILL.md front matter: what the tool is and when an agent should load it
@@ -29,9 +29,12 @@ void install_extras(Json& result);  // installs what the tool carries besides th
 std::string tool_home();  // ~/.<name>, or $<env>_HOME
 CommandOutput cmd_install(const Json& args);
 CommandOutput cmd_update(const Json& args);
-// MCP server start: looks for a newer release (at most every few hours) and installs it in the background.
-void start_auto_update();
-// "<Title> X is available ..." when the last check found a release this binary has not caught up with, or "".
+// MCP server start: looks for a newer release in the background, at most every few hours. It installs nothing.
+void start_update_check();
+// What the last check found, or "" when this binary is up to date. update_notice is for a person ("<Title> X is
+// available ... Run `<name> update`"); update_request goes in the MCP instructions and asks the agent to run the
+// update itself.
 std::string update_notice();
+std::string update_request();
 
 }  // namespace TOOL_NS

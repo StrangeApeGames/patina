@@ -184,37 +184,29 @@ EOF
   [ $code -ne 0 ] && echo "$out" | grep -q "checksum mismatch" || fail "bad checksum must be rejected"
   ok "update: check, verified install, checksum mismatch rejected"
 
-  # auto-update: when the installed binary's MCP server starts it finds the release, verifies it and installs it in
-  # the background. An install shows as the skill being written again.
+  # The MCP server only looks for a newer release; installing is left to `update`. It must never download or
+  # install by itself: Windows Defender removes a binary that does (see src/selfupdate.cpp).
   INSTALLED="$PATINA_HOME/bin/$(basename "$EXE")"
   SKILL="$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md"
   STATE="$PATINA_HOME/update_check.json"
-  serve() {  # $1 = binary: runs its MCP server until its update check has finished (or 30 s pass)
-    rm -f "$STATE" "$SKILL"
-    ( echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-      for _ in $(seq 150); do [ -f "$STATE" ] && [ ! -d "$PATINA_HOME/update.lock" ] && break; sleep 0.2; done ) | "$1" mcp >/dev/null
-  }
+  INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
   unset PATINA_NO_UPDATE_CHECK
   export PATINA_RELEASES_API=$(release_json)
-  rm -rf "$CODEX_HOME/skills/patina"  # a skill the user removed stays removed
-  serve "$INSTALLED"
-  [ -f "$SKILL" ] || fail "the MCP server did not install the newer release"
-  [ ! -d "$CODEX_HOME/skills/patina" ] || fail "an unattended update must only renew the skills that are installed"
-  [[ "$("$INSTALLED" version)" != *"is available"* ]] || fail "an installed release must not be announced"
-  export PATINA_NO_AUTO_UPDATE=1
-  serve "$INSTALLED"
-  [ ! -f "$SKILL" ] || fail "PATINA_NO_AUTO_UPDATE must not install"
-  [[ "$("$INSTALLED" version)" == *"99.0.0 is available"* ]] || fail "PATINA_NO_AUTO_UPDATE must still announce the release"
-  unset PATINA_NO_AUTO_UPDATE
-  serve "$BIN"
-  [ ! -f "$SKILL" ] || fail "a build that is not the installed copy must not install"
-  export PATINA_RELEASES_API=$(release_json 0000000000000000000000000000000000000000000000000000000000000000)
-  serve "$INSTALLED"
-  [ ! -f "$SKILL" ] || fail "a release with a bad checksum must not be installed"
-  [[ "$("$INSTALLED" version)" == *"automatic update failed: checksum mismatch"* ]] || fail "a failed auto-update must be reported"
-  unset PATINA_RELEASES_API
+  rm -f "$STATE" "$SKILL"
+  ( echo "$INIT"; for _ in $(seq 150); do [ -s "$STATE" ] && break; sleep 0.2; done ) | "$INSTALLED" mcp >/dev/null
+  [ "$(json "d['latest']" < "$STATE")" = "99.0.0" ] || fail "the MCP server did not record the newer release"
+  [ ! -f "$SKILL" ] && [ -z "$(ls "$PATINA_HOME/downloads" 2>/dev/null)" ] || fail "the MCP server must not install anything by itself"
+  said=$(echo "$INIT" | "$INSTALLED" mcp | json "d['result']['instructions']")
+  [[ "$said" == *"99.0.0 is available"* && "$said" == *"in a shell"* ]] || fail "the installed server must ask the agent to update"
+  said=$(echo "$INIT" | "$BIN" mcp | json "d['result']['instructions']")
+  [[ "$said" == *"99.0.0 is available"* && "$said" != *"in a shell"* ]] || fail "a build that is not the installed copy must only mention the release"
+  [[ "$("$INSTALLED" version)" == *"99.0.0 is available"* ]] || fail "version must announce the release"
   export PATINA_NO_UPDATE_CHECK=1
-  ok "auto-update: installs in the background, opt-out, dev builds, checksum mismatch reported"
+  rm -f "$STATE"
+  echo "$INIT" | "$INSTALLED" mcp >/dev/null; sleep 1
+  [ ! -f "$STATE" ] || fail "PATINA_NO_UPDATE_CHECK must stop the check"
+  unset PATINA_RELEASES_API
+  ok "update notice: the server only checks and asks the agent to update, opt-out"
 fi
 unset PATINA_HOME CLAUDE_CONFIG_DIR CODEX_HOME
 

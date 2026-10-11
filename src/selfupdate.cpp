@@ -11,12 +11,14 @@
 //                    release's SHA256SUMS.txt and runs the new binary's `install`, so the skill and guide
 //                    always match the binary.
 //
-// The MCP server updates on its own. When it starts it looks for a newer release, at most once every few hours,
-// and installs it in the background the same way `update` does, except that it only renews what is already
-// installed (`install --refresh`: the binary and the skills that are still there). A running server keeps the
-// binary it started with, so the new version takes effect the next time the agent starts. <TOOL>_NO_AUTO_UPDATE=1 reduces this to a
-// notice, and <TOOL>_NO_UPDATE_CHECK=1 turns the check off as well. A binary that is not the installed copy (a
-// build in a repo) never installs anything by itself.
+// Nothing is installed unless `install` or `update` is run. When the MCP server starts it looks for a newer
+// release, at most once every few hours, and from then on tells the agent that one is out and to run
+// `<tool> update` itself. <TOOL>_NO_UPDATE_CHECK=1 turns the check off.
+//
+// The server must not download and install a release on its own. That was tried: a long-lived process driven
+// over a pipe that fetches an executable and runs it is what Windows Defender's behaviour monitoring calls a
+// trojan (Trojan:Win32/Bearfoos.A!ml), and Defender removed every copy of the binary. The same download run by
+// `update` from a shell is not flagged.
 //
 // Downloads go through the system curl (built into macOS and Windows 10+).
 #include <cctype>
@@ -46,7 +48,7 @@ namespace {
 namespace fs = std::filesystem;
 
 const int64_t kCheckEverySeconds = 6 * 3600;
-const int64_t kStaleSeconds = 15 * 60;  // a lock or a download this old was left by a process that was killed
+const int64_t kStaleSeconds = 15 * 60;  // a download this old was left by a process that was killed
 
 std::string env(const std::string& k) {
   const char* v = std::getenv(k.c_str());
@@ -236,8 +238,7 @@ Release fetch_latest_release(int timeout_s) {
 // ~/.<tool>/update_check.json: when the releases were last looked at, and what was found.
 struct State {
   int64_t checked_at = 0;
-  std::string latest;  // newest release seen, "" when GitHub could not be reached
-  std::string error;   // why the automatic update to `latest` failed, "" when it did not
+  std::string latest;  // newest release seen, "" when GitHub has never been reached
 };
 
 std::string state_path() { return path_join(tool_home(), "update_check.json"); }
@@ -250,7 +251,6 @@ State read_state() {
     if (read_file(state_path(), text) && Json::try_parse(text, j, err)) {
       s.checked_at = (int64_t)j.num("checked_at", 0);
       s.latest = j.str("latest");
-      s.error = j.str("error");
     }
   } catch (...) {
   }
@@ -262,37 +262,15 @@ bool check_is_due() {
   return since < 0 || since >= kCheckEverySeconds;  // a time in the future: the clock was wrong once
 }
 
-void write_state(const std::string& latest, const std::string& error = "") {
+void write_state(const std::string& latest) {
   Json j = Json::object();
   j.set("checked_at", (int64_t)std::time(nullptr));
   j.set("latest", latest);
-  if (!error.empty()) j.set("error", error);
   try {
     make_dirs(tool_home());
     write_file_or_throw(state_path(), j.dump(2));
   } catch (...) {
   }
-}
-
-// Several MCP servers often start together; the lock lets one of them check and install.
-std::string lock_path() { return path_join(tool_home(), "update.lock"); }
-
-bool lock_updates() {
-  std::error_code ec;
-  fs::create_directories(tool_home(), ec);
-  if (fs::create_directory(lock_path(), ec)) return true;
-  if (age_seconds(lock_path()) < kStaleSeconds) return false;
-  // Left by a server that was closed mid-update. Renaming it away has one winner when several servers find it.
-  std::string stale = strf("%s.stale-%d", lock_path().c_str(), process_id());
-  fs::rename(lock_path(), stale, ec);
-  if (ec) return false;
-  fs::remove(stale, ec);
-  return fs::create_directory(lock_path(), ec);
-}
-
-void unlock_updates() {
-  std::error_code ec;
-  fs::remove(lock_path(), ec);
 }
 
 // ---------------------------------------------------------------- install
@@ -353,10 +331,10 @@ std::string skill_markdown(const std::string& exe) {
   md += strf("```\n\"%s\" --help\n```\n\n", exe.c_str());
   md += mcp_instructions();
   md += strf("\n\nBefore non-trivial work, read [AGENT_GUIDE.md](AGENT_GUIDE.md) in this folder: %s.\n\n", t.guide_summary);
-  md += strf("%s keeps itself up to date: its MCP server installs new releases in the background, and they take effect "
-             "the next time the agent starts. `%s update` installs the latest release now. If %s says an update failed, "
-             "tell the user.\n\n",
-             t.title, t.name, t.title);
+  md += strf("When %s says a newer version is available, run `\"%s\" update` in a shell: it downloads the release, checks "
+             "its SHA-256 and reinstalls, which also refreshes this skill. Then tell the user that the new version loads "
+             "the next time the agent starts.\n\n",
+             t.title, exe.c_str());
   md += strf("<!-- Written by `%s install`; overwritten on every update. Edit docs/AGENT_GUIDE.md in the %s repo instead. -->\n",
              t.name, t.title);
   return md;
@@ -496,31 +474,6 @@ Json download_and_install(const Release& rel, const std::string& install_flags) 
   return installed;
 }
 
-// The body of the background update. The caller holds the lock.
-void check_and_install() {
-  Release rel;
-  try {
-    rel = fetch_latest_release(10);
-  } catch (...) {
-    // Offline: try again in a few hours rather than on every start, and keep what the last check found.
-    State s = read_state();
-    write_state(s.latest, s.error);
-    return;
-  }
-  bool installed_copy = same_path(exe_path(), installed_exe());
-  if (!is_newer(rel.version, tool_info().version) || !installed_copy || !tool_env("NO_AUTO_UPDATE").empty()) {
-    write_state(rel.version);
-    return;
-  }
-  // Nothing is recorded until the install has finished, so a server that is closed half way through leaves the
-  // next one to start again. The new binary's install records its own version.
-  try {
-    download_and_install(rel, " --refresh");
-  } catch (const std::exception& e) {
-    write_state(rel.version, e.what());
-  }
-}
-
 }  // namespace
 
 std::string tool_home() {
@@ -546,18 +499,14 @@ CommandOutput cmd_install(const Json& a) {
   r.set("exe", target);
   install_extras(r);
 
-  // --refresh is what an unattended update runs: it renews what is installed (the binary, and the skills that
-  // are still there) and leaves the agents' configuration and the PATH alone.
-  bool refresh = a.boolean("refresh", false);
-  bool skill = !a.boolean("no_skill", false), mcp = !refresh && !a.boolean("no_mcp", false);
+  bool skill = !a.boolean("no_skill", false), mcp = !a.boolean("no_mcp", false);
   Json agents = Json::object();
   for (auto& agent : known_agents(target)) {
     bool has_cli = mcp && has_command(agent.cli);
-    std::string dir = path_join(agent.home, std::string("skills/") + t.name);
-    bool present = refresh ? is_directory(dir) : agent.home_from_env || is_directory(agent.home) || has_cli;
-    if (!present) continue;
+    if (!agent.home_from_env && !is_directory(agent.home) && !has_cli) continue;  // not on this machine
     Json j = Json::object();
     if (skill) {
+      std::string dir = path_join(agent.home, std::string("skills/") + t.name);
       make_dirs(dir);
       write_file_or_throw(path_join(dir, "SKILL.md"), skill_markdown(target));
       write_file_or_throw(path_join(dir, "AGENT_GUIDE.md"), std::string(agent_guide()));
@@ -571,7 +520,7 @@ CommandOutput cmd_install(const Json& a) {
   server.set("command", target);
   server.set("args", Json::array({Json("mcp")}));
   r.set("mcp_server", server);
-  if (!refresh && !a.boolean("no_path", false)) r.set("path", add_to_path(bin_dir()));
+  if (!a.boolean("no_path", false)) r.set("path", add_to_path(bin_dir()));
   write_state(t.version);  // just installed: nothing newer to announce until the next check
   r.set("next", "Restart the agent so it loads the MCP server and the skill.");
   CommandOutput o;
@@ -604,37 +553,45 @@ CommandOutput cmd_update(const Json& a) {
   return o;
 }
 
-void start_auto_update() {
-  if (!tool_env("NO_UPDATE_CHECK").empty()) return;
+// Looks only. See the note at the top of this file before making it do more.
+void start_update_check() {
   try {
-    if (!check_is_due() || !lock_updates()) return;
-    if (!check_is_due()) {  // a server that started alongside this one has just finished the check
-      unlock_updates();
-      return;
-    }
+    if (!tool_env("NO_UPDATE_CHECK").empty() || !check_is_due()) return;
+    std::thread([] {
+      try {
+        write_state(fetch_latest_release(10).version);
+      } catch (...) {
+        // Offline: try again in a few hours rather than on every start, and keep what the last check found.
+        write_state(read_state().latest);
+      }
+    }).detach();
   } catch (...) {
-    return;
   }
-  std::thread([] {
-    try {
-      check_and_install();
-    } catch (...) {
-    }
-    try {
-      unlock_updates();
-    } catch (...) {
-    }
-  }).detach();
 }
 
 std::string update_notice() {
   try {
     const ToolInfo& t = tool_info();
-    State s = read_state();
-    if (!is_newer(s.latest, t.version)) return "";
-    std::string notice = strf("%s %s is available (this is %s).", t.title, s.latest.c_str(), t.version);
-    if (!s.error.empty()) notice += " The automatic update failed: " + s.error + ".";
-    return notice + strf(" Run `%s update` to upgrade.", t.name);
+    std::string latest = read_state().latest;
+    if (!is_newer(latest, t.version)) return "";
+    return strf("%s %s is available (this is %s). Run `%s update` to upgrade.", t.title, latest.c_str(), t.version, t.name);
+  } catch (...) {
+    return "";
+  }
+}
+
+std::string update_request() {
+  try {
+    const ToolInfo& t = tool_info();
+    std::string latest = read_state().latest;
+    if (!is_newer(latest, t.version)) return "";
+    std::string said = strf("%s %s is available (this is %s).", t.title, latest.c_str(), t.version);
+    // Only the installed copy is the agent's to update; a build in a repo belongs to whoever is working on it.
+    if (!same_path(exe_path(), installed_exe())) return said + " Mention this to the user.";
+    return said + strf(" Update it now: run `\"%s\" update` in a shell. It downloads the release, checks its SHA-256 and "
+                       "reinstalls. Then tell the user that it was updated and that the new version loads the next time "
+                       "you start.",
+                       installed_exe().c_str());
   } catch (...) {
     return "";
   }

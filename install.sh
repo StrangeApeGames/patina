@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs the latest Patina release (the binary, plus the skill and MCP server for Claude Code and Codex):
 #   curl -fsSL https://raw.githubusercontent.com/parodyband/patina/main/install.sh | sh
-# Afterwards Patina keeps itself up to date.
+# Afterwards `patina update` keeps it current; its MCP server tells your agent when to run it.
 set -eu
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) asset=patina-macos-arm64 ;;

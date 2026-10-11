@@ -118,19 +118,18 @@ It puts the binary in `~/.patina/bin` (added to your PATH). For Claude Code and 
 machine, it writes the `patina` skill (`~/.claude/skills/patina`, `~/.codex/skills/patina`) and registers the MCP
 server for every project. Any other agent can run `~/.patina/bin/patina mcp` as a stdio MCP server.
 
-**Updating.** Patina keeps itself up to date. When the MCP server starts it looks for a newer release, at most
-once every six hours. If there is one it downloads it, checks it against the release's SHA-256 sums and installs
-it in the background, which also refreshes the skills and guide; the new version is used the next time the agent
-starts. `patina update` does the same straight away. Set `PATINA_NO_AUTO_UPDATE=1` to be told about new releases
-instead (by the agent, and by `patina version`), or `PATINA_NO_UPDATE_CHECK=1` to turn the check off. A build run
-from the repo never installs anything by itself.
+**Updating.** `patina update` downloads the newest release, checks it against the release's SHA-256 sums and
+reinstalls, which also refreshes the skills and guide. Your agent runs it for you: when the MCP server starts it
+looks for a newer release, at most once every six hours, and from then on asks the agent to run the update;
+`patina version` tells you too. The new version is used the next time the agent starts. Set
+`PATINA_NO_UPDATE_CHECK=1` to turn the check off. Patina never downloads or installs anything by itself.
 
 From a source build, `build/patina install` does the same setup with your own binary. Flags: `--no-skill`,
 `--no-mcp`, `--no-path`.
 
 **Releasing.** Bump `VERSION` in `CMakeLists.txt`, then push a matching tag (`git tag v0.3.0 && git push --tags`).
-CI builds and tests both platforms and publishes the binaries with `SHA256SUMS.txt` as a GitHub release. Installed
-copies pick a release up by themselves within hours, so a tag is a deployment.
+CI builds and tests both platforms and publishes the binaries with `SHA256SUMS.txt` as a GitHub release. Agents
+are told about a release within hours and asked to install it, so a tag is a deployment.
 
 ## Build
 
@@ -244,7 +243,7 @@ patina guide                                                            # the ag
 | `src/export.*` | channel packing, manifest, textured GLB |
 | `src/commands.*` | command implementations shared by the CLI and MCP; session caches |
 | `src/mcp.cpp` | MCP server (stdio JSON-RPC, concurrent tool calls) |
-| `src/selfupdate.*` | `install` / `update` and the background auto-update: installed binary, agent skills, MCP registration, verified downloads. Identical to the copy in [Chisel](https://github.com/parodyband/chisel); change both together |
+| `src/selfupdate.*` | `install` / `update` and the release check: installed binary, agent skills, MCP registration, verified downloads. Identical to the copy in [Chisel](https://github.com/parodyband/chisel); change both together |
 | `src/tool.cpp` | what `selfupdate` needs to know about Patina, and the Blender bridge an install carries |
 | `src/viewer.cpp` | sokol + Dear ImGui viewer |
 | `tools/blender/` | Blender bridge (`export` .blend→.glb, `apply` manifest→Principled BSDF) |

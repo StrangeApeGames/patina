@@ -188,7 +188,7 @@ int run_mcp_server() {
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stdin), _O_BINARY);
 #endif
-  start_auto_update();
+  start_update_check();
   std::atomic<int> inflight{0};
   std::mutex cv_m;
   std::condition_variable cv;
@@ -221,9 +221,8 @@ int run_mcp_server() {
       info.set("name", "patina");
       info.set("version", patina_version());
       r.set("serverInfo", info);
-      std::string notice = update_notice();
-      r.set("instructions", notice.empty() ? std::string(kInstructions)
-                                           : std::string(kInstructions) + "\n\n" + notice + " Mention this to the user.");
+      std::string request = update_request();
+      r.set("instructions", request.empty() ? std::string(kInstructions) : std::string(kInstructions) + "\n\n" + request);
       send_result(id, r);
     } else if (method == "ping") {
       if (is_request) send_result(id, Json::object());
