@@ -69,9 +69,12 @@ struct GpuScene {
 };
 
 // Runs `kernel` over n elements in chunks: fill(first, count, dst) writes `count` input records for elements
-// first.., store(first, count, src) receives their output records. Chunks are sized to take a fraction of a
-// second each: Windows resets a GPU that does not answer for 2 s, and the desktop stutters long before that.
+// first.., store(first, count, src) receives their output records. Chunks are sized to take a few milliseconds
+// each: Windows resets a GPU that does not answer for 2 s, and the desktop stutters long before that.
+// `rays` is the most rays one element can trace; it caps a chunk whatever the previous ones took, because
+// cheap elements (rays that leave the mesh at once) can be followed by expensive ones.
 void gpu_run(Gpu& gpu, GpuKernel kernel, GpuParams params, const GpuScene& scene, size_t n, uint32_t in_stride, uint32_t out_stride,
-             const std::function<void(size_t, size_t, void*)>& fill, const std::function<void(size_t, size_t, const void*)>& store);
+             uint64_t rays, const std::function<void(size_t, size_t, void*)>& fill,
+             const std::function<void(size_t, size_t, const void*)>& store);
 
 }  // namespace pt

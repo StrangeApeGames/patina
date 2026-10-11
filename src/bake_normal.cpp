@@ -543,6 +543,12 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         in.group = (uint32_t)low_group[low.tri_part[t]];
         return in;
       };
+      // Is o inside a solid? Looking away from the low surface, the first thing seen is then the inside of a wall.
+      auto inside = [&](const SubBVH& g, vec3 o, vec3 d) {
+        float t, u, v;
+        uint32_t tri;
+        return g.hit(o, d, 0.f, 1e30f, t, tri, u, v) && dot(tri_normal(*high, tri), d) > 0.f;
+      };
       // CPU estimator, mirrored by the project kernel in shaders/bake.hlsl
       auto project = [&](const GpuProjIn& in) {
         GpuProjOut r{};
@@ -566,10 +572,11 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
             for (int k = 0; k < 8 && !found; k++) {
               // the first high-poly surface facing the cage ...
               if (!g.hit(o, -in.dir, tmin, tmax, th, ht, u, v, s.ignore_backfaces ? BVH::kFront : BVH::kAny)) break;
-              // ... unless a backface lies on it: that is where two solid parts touch (a bolt resting on a plate)
-              // and the ray started inside one of them, so the cage is too tight here. Testing a window around
-              // the hit instead of comparing two distances keeps this independent of float rounding.
-              if (s.ignore_backfaces && g.bvh.occluded(o, -in.dir, th - eps, th + eps, BVH::kBack)) tmin = th + eps;
+              // ... unless a backface lies on it and the ray started inside a solid: that is where two parts touch
+              // (a bolt resting on a plate, the cage inside the bolt), not a visible surface. Testing a window
+              // around the hit instead of comparing two distances keeps this independent of float rounding. A
+              // two-sided card (the same faces twice, one flipped) passes: its rays start outside.
+              if (s.ignore_backfaces && g.bvh.occluded(o, -in.dir, th - eps, th + eps, BVH::kBack) && inside(g, o, in.dir)) tmin = th + eps;
               else found = true;
             }
             if (found) {
@@ -615,7 +622,8 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         std::vector<uint32_t> edge_ids;
         GpuParams first_pass = p;
         if (R > 0) first_pass.flags |= kGpuBevelDetect;
-        gpu_run(*gpu, GpuKernel::Project, first_pass, scene, n, sizeof(GpuProjIn), sizeof(GpuProjOut),
+        uint64_t rays = (uint64_t)grid * grid * 3;  // per texel: every supersample's hit, backface window and inside test
+        gpu_run(*gpu, GpuKernel::Project, first_pass, scene, n, sizeof(GpuProjIn), sizeof(GpuProjOut), rays,
                 [&](size_t first, size_t count, void* dst) {
                   parallel_for((int64_t)count, 256, [&](int64_t b, int64_t e) {
                     for (int64_t j = b; j < e; j++) ((GpuProjIn*)dst)[j] = setup(first + j);
@@ -629,6 +637,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
                   for (size_t j = 0; j < count; j++) if (r[j].flags & kGpuOutNear) edge_ids.push_back((uint32_t)(first + j));
                 });
         gpu_run(*gpu, GpuKernel::Project, p, scene, edge_ids.size(), sizeof(GpuProjIn), sizeof(GpuProjOut),
+                rays + (uint64_t)grid * grid * s.bevel_samples * 4,  // the bevel: up to 4 hits per probe
                 [&](size_t first, size_t count, void* dst) {
                   parallel_for((int64_t)count, 256, [&](int64_t b, int64_t e) {
                     for (int64_t j = b; j < e; j++) ((GpuProjIn*)dst)[j] = setup(edge_ids[first + j]);
@@ -660,7 +669,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         GpuParams p;
         p.samples = (uint32_t)s.bevel_samples;
         p.bevel_r = R;
-        gpu_run(*gpu, GpuKernel::Bevel, p, scene, edge_ids.size(), sizeof(GpuBevelIn), 4 * sizeof(float),
+        gpu_run(*gpu, GpuKernel::Bevel, p, scene, edge_ids.size(), sizeof(GpuBevelIn), 4 * sizeof(float), (uint64_t)s.bevel_samples * 4,
                 [&](size_t first, size_t count, void* dst) {
                   parallel_for((int64_t)count, 1024, [&](int64_t b, int64_t e) {
                     for (int64_t j = b; j < e; j++) {
@@ -718,7 +727,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         p.maxd = maxd;
         p.eps = aeps;
         p.bvh = high_all_gpu;
-        gpu_run(*gpu, GpuKernel::AoHigh, p, scene, ids.size(), sizeof(GpuHit), sizeof(uint32_t),
+        gpu_run(*gpu, GpuKernel::AoHigh, p, scene, ids.size(), sizeof(GpuHit), sizeof(uint32_t), (uint64_t)N,
                 [&](size_t first, size_t count, void* dst) {
                   parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
                     for (int64_t j = b; j < e; j++) {

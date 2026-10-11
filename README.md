@@ -82,6 +82,8 @@ RTX 4070 Ti SUPER, against the same build on the 32 threads of a Ryzen 9 7950X3D
 - Both devices run the same estimators with the same sample sequences. `patina bake <project> --verify` bakes on
   both and reports how far apart each map is; the test suite runs it on its AO, projection and bevel projects.
 - Any failure on the GPU (driver reset, out of video memory) re-bakes on the CPU and is reported in the stats.
+- A bake does not own the GPU: dispatches last a few milliseconds and the GPU is left idle for a tenth of that
+  after each one, so the desktop and other applications get their turn during a long bake.
 - `PATINA_GPU=0` turns the GPU off, `PATINA_GPU=<part of an adapter name>` picks one, and `PATINA_GPU=warp` uses
   Direct3D's software rasterizer, which is how the tests exercise the kernels on machines without a GPU.
   macOS bakes on the CPU for now.

@@ -313,6 +313,7 @@ sit on top. It also feeds the curvature map, so `edge_wear` and dirt follow bake
 - Check `render(mode="bake_normal")`, `render(mode="bake_misses")` and `render(mode="bake_ao")` before texturing.
 - Misses in one area only? Paint the cage there (`cage_mask`) instead of growing it everywhere, which invites bleed from neighbouring surfaces.
 - Misses under a detail that rests on a surface (a bolt head, a strap) mean rays start inside it: the cage must clear the tallest detail.
+- High sample counts multiply: `samples` x `bevel.samples` rays per texel near an edge. The defaults (4 x 64) are enough for almost everything; 64 x 1024 keeps a GPU busy for minutes.
 - `bake` reports groups, misses and warnings (for example, a low part with no `_high` partner).
 - Low-poly rules still apply: triangulate, split UVs at hard edges, keep the high poly inside the cage.
 - A bevel-only bake is the fast path for hard-surface lows without a high poly: rounded edges and edge wear in one line.
