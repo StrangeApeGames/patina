@@ -23,7 +23,7 @@ const ToolInfo& tool_info() {
           "Texture 3D models with Patina, a headless Substance-Painter-style PBR texturing engine (layer stacks, "
           "smart materials, edge wear/dirt/rust masks, paint strokes, decals, previews). Use when asked to texture, paint, "
           "weather or age a 3D asset (.glb/.gltf/.obj or a Blender object), or to make PBR texture maps for Blender, Unreal, "
-          "Unity, Godot or glTF.",
+          "Unity, Godot, glTF or USD.",
       .guide_summary = "recipes, every mask field, export presets and common mistakes",
   };
   return t;

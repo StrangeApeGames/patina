@@ -5,6 +5,7 @@
 
 #include "image.h"
 #include "library.h"
+#include "usd.h"
 
 namespace pt {
 
@@ -50,16 +51,113 @@ bool channel_used(const SetMaps& m, const std::string& ch) {
 }
 }  // namespace
 
+namespace {
+// What a preset map holds for one texture set: a color in rgb (with an optional alpha source), or one source per channel.
+struct MapLayout {
+  std::string rgb;
+  std::string src[4];
+  int comps = 1;
+  // The source written to channel k when there is no rgb color. A channel the preset leaves out repeats the
+  // first, and a missing alpha is one.
+  std::string source(int k) const { return src[k].empty() ? (k == 3 ? std::string("one") : src[0]) : src[k]; }
+};
+
+const char* const kChannelNames[4] = {"r", "g", "b", "a"};
+
+MapLayout map_layout(const Json& spec, const SetMaps& m) {
+  MapLayout l;
+  l.rgb = spec.str("rgb", "");
+  for (int k = 0; k < 4; k++) l.src[k] = spec.str(kChannelNames[k], "");
+  if (!spec.str("alpha_if_used", "").empty() && !channel_used(m, spec.str("alpha_if_used"))) l.src[3].clear();
+  if (!l.rgb.empty()) l.comps = l.src[3].empty() ? 3 : 4;
+  else if (!l.src[3].empty()) l.comps = 4;
+  else if (!l.src[2].empty() || !l.src[1].empty()) l.comps = 3;
+  else l.comps = 1;
+  return l;
+}
+
+// A preset map that was written for a texture set, and the file it went to.
+struct WrittenMap {
+  const Json* spec;
+  std::string file;
+};
+
+// The two packings a USD material can only read by remapping a texture's values, which not every importer does.
+struct UsdRemaps {
+  bool green_flipped = false;       // DirectX normals
+  bool smoothness_inverted = false;  // smoothness where USD wants roughness
+};
+
+// The USD material for one texture set: each UsdPreviewSurface input, found in the maps the preset wrote. It
+// looks where write_map put things (both use map_layout), so it follows any packing: ORM, a Unity mask map
+// with smoothness in alpha, separate files. An input the preset does not write is left at USD's default.
+UsdMaterial usd_material(const SetMaps& m, const std::vector<WrittenMap>& written, bool directx, UsdRemaps& remaps) {
+  UsdMaterial mat;
+  mat.set = m.set;
+  mat.name = m.name;
+  auto image_of = [&](const WrittenMap& w) {
+    for (size_t i = 0; i < mat.images.size(); i++)
+      if (mat.images[i].file == w.file) return (int)i;
+    UsdImage image;
+    image.key = w.spec->str("key", path_stem(w.file));
+    image.file = w.file;
+    image.srgb = w.spec->boolean("srgb", false);
+    mat.images.push_back(image);
+    return (int)mat.images.size() - 1;
+  };
+  auto find_color = [&](const std::string& source) -> UsdInput {
+    for (const WrittenMap& w : written)
+      if (map_layout(*w.spec, m).rgb == source) return {image_of(w), "rgb"};
+    return {};
+  };
+  // `channel` gets the index of the channel in the image, for a remap of just that channel
+  auto find_channel = [&](const std::string& source, int* channel = nullptr) -> UsdInput {
+    for (const WrittenMap& w : written) {
+      MapLayout l = map_layout(*w.spec, m);
+      for (int k = l.rgb.empty() ? 0 : 3; k < l.comps; k++) {
+        if (l.source(k) != source) continue;
+        if (channel) *channel = k;
+        return {image_of(w), kChannelNames[k]};
+      }
+    }
+    return {};
+  };
+
+  mat.basecolor = find_color("basecolor");
+  mat.metallic = find_channel("metallic");
+  mat.occlusion = find_channel("ao");
+  mat.roughness = find_channel("roughness");
+  if (mat.roughness.image < 0) {
+    int k = 0;
+    mat.roughness = find_channel("smoothness", &k);
+    if (mat.roughness.image >= 0) {  // roughness = 1 - smoothness
+      mat.images[mat.roughness.image].scale[k] = -1.f;
+      mat.images[mat.roughness.image].bias[k] = 1.f;
+      remaps.smoothness_inverted = true;
+    }
+  }
+  mat.normal = find_color("normal");
+  if (mat.normal.image >= 0) {
+    // a stored 0..1 becomes the -1..1 vector, with green flipped when the preset stores DirectX normals
+    UsdImage& image = mat.images[mat.normal.image];
+    float sign[3] = {1.f, directx ? -1.f : 1.f, 1.f};
+    for (int k = 0; k < 3; k++) {
+      image.scale[k] = 2.f * sign[k];
+      image.bias[k] = -sign[k];
+    }
+    remaps.green_flipped = remaps.green_flipped || directx;
+  }
+  if (m.used[C_EMISSIVE]) mat.emissive = find_color("emissive");
+  if (m.used[C_OPACITY]) mat.opacity = find_channel("opacity");
+  return mat;
+}
+}  // namespace
+
 static void write_map(const Json& spec, const SetMaps& m, bool directx, const std::string& path) {
-  // work out layout
-  std::string rgb = spec.str("rgb", "");
-  std::string src[4] = {spec.str("r", ""), spec.str("g", ""), spec.str("b", ""), spec.str("a", "")};
-  if (!spec.str("alpha_if_used", "").empty() && !channel_used(m, spec.str("alpha_if_used"))) src[3].clear();
-  int comps;
-  if (!rgb.empty()) comps = src[3].empty() ? 3 : 4;
-  else if (!src[3].empty()) comps = 4;
-  else if (!src[2].empty() || !src[1].empty()) comps = 3;
-  else comps = 1;
+  MapLayout layout = map_layout(spec, m);
+  const std::string& rgb = layout.rgb;
+  const std::string* src = layout.src;
+  int comps = layout.comps;
   size_t npx = (size_t)m.res * m.res;
   std::vector<float> img(npx * comps);
   Sources S{&m, directx};
@@ -73,8 +171,7 @@ static void write_map(const Json& spec, const SetMaps& m, bool directx, const st
         if (comps == 4) { S.get(src[3], t, tmp, 1); o[3] = tmp[0]; }
       } else {
         for (int k = 0; k < comps; k++) {
-          const std::string& s = src[k].empty() ? (k == 3 ? std::string("one") : src[0]) : src[k];
-          S.get(s, t, tmp, 1);
+          S.get(layout.source(k), t, tmp, 1);
           o[k] = tmp[0];
         }
       }
@@ -84,7 +181,7 @@ static void write_map(const Json& spec, const SetMaps& m, bool directx, const st
 }
 
 Json export_textures(const Project& p, const Baked& bk, const std::vector<SetResult>& results, const std::string& preset_name,
-                     const std::string& out_dir, bool write_glb) {
+                     const std::string& out_dir, bool write_glb, const std::string& usd_format) {
   const Json* preset = find_export_preset(preset_name);
   if (!preset) {
     std::string dym = did_you_mean(preset_name, builtin_library()["export_presets"].keys());
@@ -109,10 +206,13 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
   Json files = Json::array();
   struct Task { const Json* spec; const SetMaps* m; std::string path; };
   std::vector<Task> tasks;
+  std::vector<UsdMaterial> usd_materials;
+  UsdRemaps usd_remaps;
   for (auto& m : maps) {
     Json sj = Json::object();
     sj.set("material", m.name);
     Json fj = Json::object();
+    std::vector<WrittenMap> written;
     for (auto& spec : (*preset)["maps"].items()) {
       std::string if_used = spec.str("if_used", "");
       if (!if_used.empty() && !channel_used(m, if_used)) continue;
@@ -120,9 +220,11 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
       size_t pos = fname.find("{set}");
       if (pos != std::string::npos) fname.replace(pos, 5, sanitize_filename(m.name));
       tasks.push_back({&spec, &m, path_join(out_dir, fname)});
+      written.push_back({&spec, fname});
       fj.set(spec.str("key", fname), fname);
       files.push(path_join(out_dir, fname));
     }
+    if (!usd_format.empty()) usd_materials.push_back(usd_material(m, written, directx, usd_remaps));
     sj.set("files", fj);
     sj.set("normal_format", directx ? "directx" : "opengl");
     sj.set("height_depth", p.height_depth() * ext);
@@ -153,6 +255,28 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
     manifest.set("glb", glb_path);
     files.push(glb_path);
   }
+  Json usd;
+  if (!usd_format.empty()) {
+    // after the images: the materials read them from this folder, and a .usdz copies them in
+    std::string usd_path = path_join(out_dir, sanitize_filename(p.name()) + "." + usd_format);
+    usd = write_usd(usd_path, usd_format, p.name(), mesh, usd_materials);
+    usd.set("path", usd_path);
+    // Both remaps are what the USD spec provides for this and render correctly where it is followed. Checked
+    // against Blender 5.2's importer, which applies the first and ignores the second.
+    Json usd_warnings = Json::array();
+    const char* advice = "Export with a preset that stores OpenGL normals and roughness (gltf, godot, blender) when the USD file is the deliverable.";
+    if (usd_remaps.green_flipped)
+      usd_warnings.push(strf("the '%s' preset stores DirectX normals, so the USD materials flip green with the texture's scale and "
+                             "bias. OpenUSD's usdchecker reports that as non-standard and an importer may ignore it. %s",
+                             preset_name.c_str(), advice));
+    if (usd_remaps.smoothness_inverted)
+      usd_warnings.push(strf("the '%s' preset stores smoothness, so the USD materials read roughness as 1 - smoothness with the texture's "
+                             "scale and bias. Some importers ignore that (Blender's does) and show the wrong roughness. %s",
+                             preset_name.c_str(), advice));
+    if (usd_warnings.size()) usd.set("warnings", usd_warnings);
+    manifest.set("usd", usd_path);
+    files.push(usd_path);
+  }
   std::string mpath = path_join(out_dir, "manifest.json");
   write_file_or_throw(mpath, manifest.dump(2) + "\n");
 
@@ -161,6 +285,7 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
   r.set("preset", preset_name);
   r.set("manifest", mpath);
   r.set("files", files);
+  if (!usd.is_null()) r.set("usd", usd);
   r.set("export_ms", tm.ms());
   return r;
 }

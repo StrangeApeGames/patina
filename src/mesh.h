@@ -32,7 +32,8 @@ struct Mesh {
 };
 
 // Loads .glb/.gltf/.obj. Node transforms are baked in (world space). Throws pt::Error.
-Mesh load_mesh(const std::string& path);
+// geometry_only skips tangents and UV islands: all a mesh that is only traced (a high poly) needs is its surface.
+Mesh load_mesh(const std::string& path, bool geometry_only = false);
 void compute_bounds(Mesh& m);
 void compute_normals_if_missing(Mesh& m, bool had_normals);
 void compute_tangents(Mesh& m);

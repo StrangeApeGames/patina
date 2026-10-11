@@ -347,7 +347,7 @@ void compute_topology(Mesh& m) {
   m.island_count = (int)remap.size();
 }
 
-Mesh load_mesh(const std::string& path) {
+Mesh load_mesh(const std::string& path, bool geometry_only) {
   if (!file_exists(path)) fail("mesh file not found: '%s'", path.c_str());
   Mesh m;
   m.path = path_abs(path);
@@ -362,6 +362,7 @@ Mesh load_mesh(const std::string& path) {
   m.content_hash = fnv1a(bytes);
   compute_bounds(m);
   compute_normals_if_missing(m, had_normals);
+  if (geometry_only) return m;
   compute_tangents(m);
   compute_topology(m);
   return m;

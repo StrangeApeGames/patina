@@ -32,7 +32,7 @@ Layers are listed **bottom to top**: later layers paint over earlier ones.
    - Get close-ups with `views=[{"azimuth":30,"elevation":10,"zoom":3,"target":[0.5,0.9,0.5]}]` and a higher `resolution` (e.g. 2048): fine grain, rust and edge wear only read up close.
    - Lighting is a studio HDRI (`environment="studio"`). Turn it with `env_rotation` to move reflections across metal, or pass a path to your own equirectangular `.hdr`.
 5. `variants(project, variants=[...])`: when unsure, render 2–6 alternatives in one call, then apply the best with `edit`.
-6. `export(project, preset, glb=true)`: writes PNGs plus `manifest.json` (and a textured `.glb`).
+6. `export(project, preset, glb=true)`: writes PNGs plus `manifest.json` (and a textured `.glb`). `usd=true` also writes the mesh as USD (see §10).
 7. `blender(action="apply", project=..., out="x.blend", render="x.png")`: builds Principled BSDF materials.
 
 ## 3. Coordinates and units
@@ -268,6 +268,30 @@ the surface, `[-0.5, 1]` leaves gaps.
 - `manifest.json` lists every file per texture set. `blender(action="apply")` reads it.
 - The normal map already contains the height detail.
 
+### USD
+
+`export(project, preset, usd=true)` (CLI `--usd`) also writes the mesh as USD next to the textures, for Blender, Maya,
+Houdini, usdview or an engine's USD importer.
+
+| `usd`              | File          | Use it for |
+|--------------------|---------------|------------|
+| `true` or `"usda"` | `<name>.usda` | Text you can read and diff. Reads the PNGs beside it. |
+| `"usdc"`           | `<name>.usdc` | The same in binary, and much smaller: a quarter of the size for a 40k-triangle mesh. |
+| `"usdz"`           | `<name>.usdz` | One file with the textures inside, to send or to view on its own. |
+
+- **Mesh:** one `Mesh` per part under a root named after the project, +Y up, in meters, with normals and UVs (`st`). A
+  part with several texture sets gets one `GeomSubset` per set.
+- **Materials:** one `UsdPreviewSurface` material per texture set, in `<root>/Materials`, named after the set. Each one
+  reads the maps the preset wrote, whatever their packing (base color, roughness, metallic, occlusion and normal,
+  plus opacity and emissive when the set uses them).
+- **Names:** USD names allow only letters, digits and `_`, so `Cube.001` becomes `Cube_001`. The original is kept as
+  the prim's `displayName`.
+- **Pick the preset for where the USD is going.** `gltf`, `godot` and `blender` store OpenGL normals and roughness,
+  which is what USD expects, so they import everywhere. `unreal` (DirectX normals) and `unity_*` (smoothness) are
+  read through a remap on the texture that some importers skip. The result's `usd.warnings` says so when it applies.
+- The result's `usd` block has the path and what the file holds (`meshes`, `triangles`, `materials`, `textures`).
+  Export reads every USD file back before it reports success, so those counts are what is in the file.
+
 ## 11. Custom smart materials
 
 Put JSON files in `<project dir>/library/` or in a directory on `$PATINA_LIBRARY`:
@@ -288,7 +312,12 @@ Put JSON files in `<project dir>/library/` or in a directory on `$PATINA_LIBRARY
 
 Add a `normal` block to the project's `bake` settings. The baked tangent-space normal (MikkTSpace, same as
 Blender/Unreal/Unity) becomes the base of every texture set's normal map; layer height and normal detail
-sit on top. It also feeds the curvature map, so `edge_wear` and dirt follow baked edges and details.
+sit on top.
+
+With a high poly, AO, thickness and curvature are measured on the high-poly surface too (as Toolbag bakes
+them): each texel is measured where it lands on the high poly, so `edge_wear`, `dirt` and every other mask
+follow its bevels, bolts and creases and not the low poly's edges. Without one (bevel only), the maps come
+from the low poly and the bevelled normal adds to the curvature.
 
 ```json
 "bake": {"normal": {"high": "crate_high.glb", "cage": 0.02, "depth": 0.02, "bevel": {"radius": 0.006}}}
@@ -303,14 +332,16 @@ sit on top. It also feeds the curvature map, so `edge_wear` and dirt follow bake
 | `skew_distance` | 0.03 | auto: distance from hard edges over which rays turn. |
 | `samples` | 4 | supersamples per texel. |
 | `bevel` | off | bevel shader: `{"radius": 0.006, "samples": 64, "min_angle": 10, "scope": "part"}` rounds edges sharper than `min_angle`. It runs on the high poly when there is one, otherwise on the low. `scope: "all"` also rounds where separate parts meet. |
-| `curvature` | 1 | how much the baked normal adds to the curvature map. |
+| `curvature` | 1 | how much the baked normal adds to the low poly's curvature map (bevel-only bakes, or `curvature_from_high: false`). |
 | `cage_mask` | none | paint the cage (Toolbag's offset map): `{"to": 0.06, "mask": [effects...]}` grows the cage toward `to` where the mask is 1. Any mask effect works: `paint` strokes, `box`, `sphere`, `select` parts, `gradient`. |
 | `skew_mask` | none | paint the skew: `{"to": 1, "mask": [...]}` pushes skew toward `to` where the mask is 1. |
 | `cage_mesh` | none | explicit cage: a pushed copy of the low with the same triangles (e.g. exported from Blender). Rays go from the cage through the low; `cage`, `skew` and the masks are ignored. |
-| `ao_from_high` | true | trace ambient occlusion from the high poly (bolts and creases occlude). The whole high mesh occludes, so parts ground each other. |
+| `ao_from_high` | true | AO and thickness of the high poly (bolts and creases occlude). The whole high mesh occludes, so parts ground each other. `false` keeps the low poly's. |
+| `curvature_from_high` | true | curvature of the high-poly surface: soft where its bevels are wide, none along the low poly's facets, and details that only exist on the high poly show. Each separate piece of the high poly (a bolt pushed into a plate) has its own curvature. `false` keeps the low poly's hard edges plus what the baked normal adds. |
 | `ignore_backfaces`, `denoise` | true | |
 
-- Check `render(mode="bake_normal")`, `render(mode="bake_misses")` and `render(mode="bake_ao")` before texturing.
+- Check `render(mode="bake_normal")`, `render(mode="bake_misses")`, `render(mode="bake_ao")` and `render(mode="curvature")` before texturing.
+- `bake` reports where the maps came from in `stats.normal.ao` and `stats.normal.curvature` (`"high"` or `"low"`). A texel that finds no high-poly surface (a miss) keeps the low poly's values.
 - Misses in one area only? Paint the cage there (`cage_mask`) instead of growing it everywhere, which invites bleed from neighbouring surfaces.
 - Misses under a detail that rests on a surface (a bolt head, a strap) mean rays start inside it: the cage must clear the tallest detail.
 - High sample counts multiply: `samples` x `bevel.samples` rays per texel near an edge. The defaults (4 x 64) are enough for almost everything; 64 x 1024 keeps a GPU busy for minutes.

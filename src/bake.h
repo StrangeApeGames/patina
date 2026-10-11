@@ -1,5 +1,6 @@
 // Mesh-map baking into UV space: surface samples per texel + AO, thickness, curvature.
 #pragma once
+#include <functional>
 #include <memory>
 
 #include "bvh.h"
@@ -31,7 +32,10 @@ struct NormalBakeSettings {
   Json skew_mask;                 // mask stack: where it is 1 skew becomes skew_to (Toolbag's skew map)
   float skew_to = 1.f;
   std::string cage_mesh;          // explicit cage (absolute path), same triangles as the low; overrides cage/skew
-  bool ao_from_high = true;       // trace AO from the high poly (whole mesh: parts occlude each other)
+  // With a high poly the mesh maps describe its surface, as in Toolbag: each texel is measured where it lands
+  // on the high poly. Texels that find no high-poly surface keep the low poly's values.
+  bool ao_from_high = true;         // AO and thickness (the whole high mesh occludes: parts ground each other)
+  bool curvature_from_high = true;  // curvature of the high-poly surface instead of the low poly's edges
   std::string base_dir;           // project directory for mask files (not part of the settings hash)
 
   bool active() const { return !high.empty() || bevel_radius > 0.f; }
@@ -99,9 +103,47 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
                                  const std::string& cache_dir, bool force, BakeDevice device = BakeDevice::Auto);
 
 class Gpu;
-// Normal bake (bake_normal.cpp): fills SampleSet::nmap/nmiss and adds normal-derived curvature.
+struct GpuSample;
+struct GpuScene;
+// Normal bake (bake_normal.cpp): fills SampleSet::nmap/nmiss. With a high poly it also moves AO, thickness
+// and curvature onto the high-poly surface; without one the bevelled normal adds to the curvature.
 // gpu = null bakes on the CPU.
 void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& s, Json& stats, Gpu* gpu);
+
+// AO and thickness of the surface in `bvh` at n points of it; point(j) is the j-th one: position, seed, smooth
+// normal and the geometric normal on the same side. `ext` is the size the settings' distances are fractions of.
+// Traced on the GPU (bvh is entry `scene_bvh` of `scene`) or, with gpu == null, on all cores.
+void trace_ao_thickness(const BVH& bvh, const BakeSettings& s, float ext, Gpu* gpu, const GpuScene& scene, uint32_t scene_bvh, size_t n,
+                        const std::function<GpuSample(size_t)>& point, float* ao, float* thickness);
+
+// Edge-integral curvature of a mesh: every edge with dihedral angle theta contributes theta * length, smoothed
+// by a kernel of radius r in 3D. Crisp, resolution-independent convex/concave masks on low-poly hard-surface
+// meshes (where vertex curvature fails) and ~mean curvature on smooth dense ones.
+class CurvatureField {
+ public:
+  // Edges flatter than min_angle_deg are ignored. With `solid` (a BVH over all of m's triangles, in order) the
+  // mesh is taken as separate pieces of surface, the way a high poly is put together: an edge then only counts
+  // for points of its own piece (tri_shell), and not at all where it is buried in another piece (the rim of a
+  // bolt sunk into a plate).
+  void build(const Mesh& m, float r, float min_angle_deg, const BVH* solid = nullptr);
+  // Curvature at p, a point of the surface with normal n: 0.5 = flat, above convex, below concave.
+  float at(vec3 p, vec3 n, float gain, uint32_t shell = kAnyShell) const;
+  size_t sample_count() const { return sw_.size(); }
+
+  static constexpr uint32_t kAnyShell = UINT32_MAX;
+  std::vector<uint32_t> tri_shell;  // connected piece of surface per triangle (only with `solid`)
+
+ private:
+  size_t cell_of(vec3 p, int& x, int& y, int& z) const;
+  float r_ = 1, cell_ = 1;
+  vec3 lo_{0, 0, 0};
+  int gx_ = 1, gy_ = 1, gz_ = 1;
+  std::vector<uint32_t> start_;   // cell -> first edge sample
+  std::vector<uint8_t> reach_;    // cell -> an edge sample within reach (most texels are nowhere near an edge)
+  std::vector<vec3> sp_, sn_;     // edge samples in cell order: position, normal
+  std::vector<float> sw_;         // signed angle * length
+  std::vector<uint32_t> shell_;
+};
 // Edge-aware 3x3 smoothing of per-sample scalars (never across UV gaps or distant surfaces).
 void denoise_samples(const SampleSet& ss, std::vector<float>& v);
 
