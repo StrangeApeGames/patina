@@ -11,6 +11,7 @@
 #include "commands.h"
 #include "core.h"
 #include "json.h"
+#include "selfupdate.h"
 
 #if defined(_WIN32)
 #include <fcntl.h>
@@ -187,7 +188,7 @@ int run_mcp_server() {
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stdin), _O_BINARY);
 #endif
-  start_update_check();
+  start_auto_update();
   std::atomic<int> inflight{0};
   std::mutex cv_m;
   std::condition_variable cv;

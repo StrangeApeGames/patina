@@ -44,7 +44,8 @@ add_library(patina_core STATIC
   src/project.cpp
   src/commands.cpp
   src/mcp.cpp
-  src/update.cpp
+  src/selfupdate.cpp
+  src/tool.cpp
 )
 target_include_directories(patina_core PUBLIC src third_party)
 

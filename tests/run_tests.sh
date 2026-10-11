@@ -149,14 +149,15 @@ ok "mcp smoke (concurrent calls)"
 
 # install + update into a sandbox home (no PATH or MCP registration); the "release" is served over file:// URLs
 EXE="$BIN"; [ -f "$EXE.exe" ] && EXE="$EXE.exe"
-export PATINA_HOME="$W/home/.patina" CLAUDE_CONFIG_DIR="$W/home/.claude"
+export PATINA_HOME="$W/home/.patina" CLAUDE_CONFIG_DIR="$W/home/.claude" CODEX_HOME="$W/home/.codex"
 "$BIN" install --no-path --no-mcp --compact >/dev/null || fail "install"
 for f in "$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md" "$CLAUDE_CONFIG_DIR/skills/patina/AGENT_GUIDE.md" \
+         "$CODEX_HOME/skills/patina/SKILL.md" "$CODEX_HOME/skills/patina/AGENT_GUIDE.md" \
          "$PATINA_HOME/tools/blender/patina_blender.py"; do
   [ -f "$f" ] || fail "install did not write $f"
 done
 grep -q '^name: patina$' "$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md" || fail "skill frontmatter"
-ok "install (binary, skill, blender bridge)"
+ok "install (binary, Claude Code and Codex skills, blender bridge)"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) ASSET=patina-windows-x64.exe ;;
   Darwin) [ "$(uname -m)" = arm64 ] && ASSET=patina-macos-arm64 || ASSET= ;;
@@ -181,9 +182,40 @@ EOF
   export PATINA_RELEASES_API=$(release_json 0000000000000000000000000000000000000000000000000000000000000000)
   set +e; out=$("$BIN" update --no-path --no-mcp --compact); code=$?; set -e
   [ $code -ne 0 ] && echo "$out" | grep -q "checksum mismatch" || fail "bad checksum must be rejected"
-  unset PATINA_RELEASES_API
   ok "update: check, verified install, checksum mismatch rejected"
+
+  # auto-update: when the installed binary's MCP server starts it finds the release, verifies it and installs it in
+  # the background. An install shows as the skill being written again.
+  INSTALLED="$PATINA_HOME/bin/$(basename "$EXE")"
+  SKILL="$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md"
+  STATE="$PATINA_HOME/update_check.json"
+  serve() {  # $1 = binary: runs its MCP server until its update check has finished (or 30 s pass)
+    rm -f "$STATE" "$SKILL"
+    ( echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+      for _ in $(seq 150); do [ -f "$STATE" ] && [ ! -d "$PATINA_HOME/update.lock" ] && break; sleep 0.2; done ) | "$1" mcp >/dev/null
+  }
+  unset PATINA_NO_UPDATE_CHECK
+  export PATINA_RELEASES_API=$(release_json)
+  rm -rf "$CODEX_HOME/skills/patina"  # a skill the user removed stays removed
+  serve "$INSTALLED"
+  [ -f "$SKILL" ] || fail "the MCP server did not install the newer release"
+  [ ! -d "$CODEX_HOME/skills/patina" ] || fail "an unattended update must only renew the skills that are installed"
+  [[ "$("$INSTALLED" version)" != *"is available"* ]] || fail "an installed release must not be announced"
+  export PATINA_NO_AUTO_UPDATE=1
+  serve "$INSTALLED"
+  [ ! -f "$SKILL" ] || fail "PATINA_NO_AUTO_UPDATE must not install"
+  [[ "$("$INSTALLED" version)" == *"99.0.0 is available"* ]] || fail "PATINA_NO_AUTO_UPDATE must still announce the release"
+  unset PATINA_NO_AUTO_UPDATE
+  serve "$BIN"
+  [ ! -f "$SKILL" ] || fail "a build that is not the installed copy must not install"
+  export PATINA_RELEASES_API=$(release_json 0000000000000000000000000000000000000000000000000000000000000000)
+  serve "$INSTALLED"
+  [ ! -f "$SKILL" ] || fail "a release with a bad checksum must not be installed"
+  [[ "$("$INSTALLED" version)" == *"automatic update failed: checksum mismatch"* ]] || fail "a failed auto-update must be reported"
+  unset PATINA_RELEASES_API
+  export PATINA_NO_UPDATE_CHECK=1
+  ok "auto-update: installs in the background, opt-out, dev builds, checksum mismatch reported"
 fi
-unset PATINA_HOME CLAUDE_CONFIG_DIR
+unset PATINA_HOME CLAUDE_CONFIG_DIR CODEX_HOME
 
 echo "== $pass passed"
