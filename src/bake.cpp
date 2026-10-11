@@ -1,8 +1,16 @@
 #include "bake.h"
 
 #include <algorithm>
+#include <array>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <filesystem>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+
+#include "bake_gpu.h"
 
 namespace pt {
 
@@ -100,6 +108,11 @@ static void raster_set(const Mesh& m, int set, int res, SampleSet& ss) {
         vec2 a = m.uv[m.idx[t * 3]] * fres, b = m.uv[m.idx[t * 3 + 1]] * fres, c = m.uv[m.idx[t * 3 + 2]] * fres;
         float area = edge_fn(a, b, c);
         float inv_area = 1.0f / area;
+        // barycentric weight -> signed distance (texels) to the opposite edge's line; a texel further than the
+        // gutter outside any of the three lines cannot be a gutter sample of this triangle
+        auto to_texels = [&](vec2 p, vec2 q) { return std::fabs(area) / std::sqrt((q.x - p.x) * (q.x - p.x) + (q.y - p.y) * (q.y - p.y)); };
+        float k0 = to_texels(b, c), k1 = to_texels(c, a), k2 = to_texels(a, b);
+        const float kFar = -kGutter * 1.001f;
         int x0 = std::max(px0, (int)std::floor(std::fmin(a.x, std::fmin(b.x, c.x)) - kGutter));
         int x1 = std::min(std::min(px0 + kTile, res) - 1, (int)std::floor(std::fmax(a.x, std::fmax(b.x, c.x)) + kGutter));
         int y0 = std::max(py0, (int)std::floor(std::fmin(a.y, std::fmin(b.y, c.y)) - kGutter));
@@ -112,6 +125,7 @@ static void raster_set(const Mesh& m, int set, int res, SampleSet& ss) {
             if (w0 >= -1e-6f && w1 >= -1e-6f && w2 >= -1e-6f) {
               if (h.dist > 0.f) h = {(int32_t)t, w0, w1, w2, 0.f};
             } else if (h.dist > 0.f) {
+              if (w0 * k0 < kFar || w1 * k1 < kFar || w2 * k2 < kFar) continue;
               float c0, c1, c2;
               float d = closest_on_tri(a, b, c, p, c0, c1, c2);
               if (d < kGutter && d < h.dist) h = {(int32_t)t, c0, c1, c2, d};
@@ -120,6 +134,10 @@ static void raster_set(const Mesh& m, int set, int res, SampleSet& ss) {
       }
       auto& out = tile_hits[ti];
       auto& tex = tile_texels[ti];
+      size_t covered = 0;
+      for (const Hit& h : local) covered += h.tri >= 0;
+      out.reserve(covered);
+      tex.reserve(covered);
       for (int ly = 0; ly < kTile; ly++)
         for (int lx = 0; lx < kTile; lx++) {
           const Hit& h = local[ly * kTile + lx];
@@ -135,52 +153,58 @@ static void raster_set(const Mesh& m, int set, int res, SampleSet& ss) {
   size_t total = 0;
   std::vector<size_t> offset(tile_hits.size());
   for (size_t i = 0; i < tile_hits.size(); i++) { offset[i] = total; total += tile_hits[i].size(); }
-  ss.texel.resize(total);
-  ss.interior.resize(total);
-  ss.tri.resize(total);
-  ss.pos.resize(total);
-  ss.nrm.resize(total);
-  ss.fnrm.resize(total);
-  ss.tan.resize(total);
-  ss.uv.resize(total);
-  ss.len_u.resize(total);
-  ss.len_v.resize(total);
+  // each array is sized (and so zero-filled and paged in) on its own thread
+  const std::function<void()> resize[] = {
+      [&] { ss.texel.resize(total); }, [&] { ss.interior.resize(total); }, [&] { ss.tri.resize(total); }, [&] { ss.pos.resize(total); },
+      [&] { ss.nrm.resize(total); },   [&] { ss.fnrm.resize(total); },     [&] { ss.tan.resize(total); }, [&] { ss.uv.resize(total); },
+      [&] { ss.len_u.resize(total); }, [&] { ss.len_v.resize(total); },
+  };
+  parallel_for((int64_t)std::size(resize), 1, [&](int64_t b, int64_t e) {
+    for (int64_t k = b; k < e; k++) resize[k]();
+  });
 
   parallel_for((int64_t)tile_hits.size(), 4, [&](int64_t b0, int64_t b1) {
+    // per-triangle quantities, kept across the run of samples that share the triangle
+    uint32_t cur = UINT32_MAX, i0 = 0, i1 = 0, i2 = 0;
+    vec3 face_n;
+    float len_u = 0, len_v = 0;
     for (int64_t ti = b0; ti < b1; ti++) {
       size_t o = offset[ti];
       for (size_t k = 0; k < tile_hits[ti].size(); k++) {
         const Hit& h = tile_hits[ti][k];
         size_t i = o + k;
         uint32_t t = (uint32_t)h.tri;
-        uint32_t i0 = m.idx[t * 3], i1 = m.idx[t * 3 + 1], i2 = m.idx[t * 3 + 2];
+        if (t != cur) {
+          cur = t;
+          i0 = m.idx[t * 3], i1 = m.idx[t * 3 + 1], i2 = m.idx[t * 3 + 2];
+          vec3 e1 = m.pos[i1] - m.pos[i0], e2 = m.pos[i2] - m.pos[i0];
+          face_n = normalize(cross(e1, e2));
+          // world units per UV unit along u and v (glTF v, pointing down the image)
+          float du1 = m.uv[i1].x - m.uv[i0].x, dv1 = m.uv[i1].y - m.uv[i0].y;
+          float du2 = m.uv[i2].x - m.uv[i0].x, dv2 = m.uv[i2].y - m.uv[i0].y;
+          float det = du1 * dv2 - du2 * dv1;
+          if (std::fabs(det) > 1e-20f) {
+            vec3 dpdu = (e1 * dv2 - e2 * dv1) / det;
+            vec3 dpdv = (e2 * du1 - e1 * du2) / det;
+            len_u = std::fmax(1e-9f, length(dpdu) / res);
+            len_v = std::fmax(1e-9f, length(dpdv) / res);
+          } else {
+            len_u = len_v = 1e-3f;
+          }
+        }
         ss.texel[i] = tile_texels[ti][k];
         ss.interior[i] = h.dist == 0.f;
         ss.tri[i] = t;
         ss.pos[i] = m.pos[i0] * h.w0 + m.pos[i1] * h.w1 + m.pos[i2] * h.w2;
-        vec3 fn = cross(m.pos[i1] - m.pos[i0], m.pos[i2] - m.pos[i0]);
         vec3 n = normalize(m.nrm[i0] * h.w0 + m.nrm[i1] * h.w1 + m.nrm[i2] * h.w2);
-        fn = normalize(fn);
-        if (dot(fn, n) < 0) fn = -fn;
         ss.nrm[i] = n;
-        ss.fnrm[i] = fn;
+        ss.fnrm[i] = dot(face_n, n) < 0 ? -face_n : face_n;
         vec3 tg = m.tan[i0].xyz() * h.w0 + m.tan[i1].xyz() * h.w1 + m.tan[i2].xyz() * h.w2;
         tg = normalize(tg - n * dot(n, tg));
         ss.tan[i] = vec4(tg, m.tan[i0].w);
         ss.uv[i] = m.uv[i0] * h.w0 + m.uv[i1] * h.w1 + m.uv[i2] * h.w2;
-        // world units per UV unit along u and v (glTF v, pointing down the image)
-        vec3 e1 = m.pos[i1] - m.pos[i0], e2 = m.pos[i2] - m.pos[i0];
-        float du1 = m.uv[i1].x - m.uv[i0].x, dv1 = m.uv[i1].y - m.uv[i0].y;
-        float du2 = m.uv[i2].x - m.uv[i0].x, dv2 = m.uv[i2].y - m.uv[i0].y;
-        float det = du1 * dv2 - du2 * dv1;
-        if (std::fabs(det) > 1e-20f) {
-          vec3 dpdu = (e1 * dv2 - e2 * dv1) / det;
-          vec3 dpdv = (e2 * du1 - e1 * du2) / det;
-          ss.len_u[i] = std::fmax(1e-9f, length(dpdu) / res);
-          ss.len_v[i] = std::fmax(1e-9f, length(dpdv) / res);
-        } else {
-          ss.len_u[i] = ss.len_v[i] = 1e-3f;
-        }
+        ss.len_u[i] = len_u;
+        ss.len_v[i] = len_v;
       }
     }
   });
@@ -189,33 +213,64 @@ static void raster_set(const Mesh& m, int set, int res, SampleSet& ss) {
   ss.interior_count = interior;
 }
 
-// Nearest-sample map via multi-source BFS (8-connected): pads every texel with the value of the
-// closest covered texel so filtering/mipmapping never bleeds background into islands.
+// Nearest-sample map: pads every texel with the closest covered texel (Euclidean), so filtering and
+// mipmapping never bleed background into islands. A separable exact distance transform (Felzenszwalb &
+// Huttenlocher): the nearest covered texel within each column, then the lower envelope of the resulting
+// parabolas along each row. Both passes run on all cores.
 static void build_padding(SampleSet& ss) {
   int res = ss.res;
-  ss.pad.assign((size_t)res * res, -1);
-  std::vector<int32_t> queue;
-  queue.reserve((size_t)res * res);
-  for (size_t i = 0; i < ss.size(); i++) {
-    ss.pad[ss.texel[i]] = (int32_t)i;
-    queue.push_back(ss.texel[i]);
-  }
-  if (queue.empty()) { std::fill(ss.pad.begin(), ss.pad.end(), -1); return; }
-  size_t head = 0;
-  static const int dx[8] = {1, -1, 0, 0, 1, 1, -1, -1}, dy[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-  while (head < queue.size()) {
-    int32_t t = queue[head++];
-    int x = t % res, y = t / res;
-    int32_t src = ss.pad[t];
-    for (int k = 0; k < 8; k++) {
-      int nx = x + dx[k], ny = y + dy[k];
-      if (nx < 0 || ny < 0 || nx >= res || ny >= res) continue;
-      int32_t nt = ny * res + nx;
-      if (ss.pad[nt] >= 0) continue;
-      ss.pad[nt] = src;
-      queue.push_back(nt);
+  size_t total = (size_t)res * res;
+  ss.pad.assign(total, -1);
+  if (ss.size() == 0) return;
+  parallel_for((int64_t)ss.size(), [&](int64_t b, int64_t e) {
+    for (int64_t i = b; i < e; i++) ss.pad[ss.texel[i]] = (int32_t)i;
+  });
+  // near_y[y * res + x]: row of the closest covered texel in column x (-1: the column is empty)
+  std::vector<int32_t> near_y(total);
+  parallel_for(res, 64, [&](int64_t x0, int64_t x1) {
+    for (int y = 0; y < res; y++)
+      for (int64_t x = x0; x < x1; x++) {
+        size_t t = (size_t)y * res + x;
+        near_y[t] = ss.pad[t] >= 0 ? y : (y > 0 ? near_y[t - res] : -1);
+      }
+    for (int y = res - 2; y >= 0; y--)
+      for (int64_t x = x0; x < x1; x++) {
+        size_t t = (size_t)y * res + x;
+        int up = near_y[t], down = near_y[t + res];
+        if (down >= 0 && (up < 0 || std::abs(down - y) < y - up)) near_y[t] = down;
+      }
+  });
+  std::vector<int32_t> pad(total);
+  parallel_for(res, 8, [&](int64_t y0, int64_t y1) {
+    std::vector<int> v(res);          // columns whose parabolas form the lower envelope
+    std::vector<double> z(res + 1);   // where each one takes over from the previous
+    for (int64_t y = y0; y < y1; y++) {
+      const int32_t* ny = &near_y[(size_t)y * res];
+      int32_t* out = &pad[(size_t)y * res];
+      auto f = [&](int x) { double d = (double)(ny[x] - y); return d * d + (double)x * x; };
+      int k = -1;
+      for (int x = 0; x < res; x++) {
+        if (ny[x] < 0) continue;
+        double start = -1e300;
+        while (k >= 0) {
+          start = (f(x) - f(v[k])) / (2.0 * (x - v[k]));
+          if (start > z[k]) break;
+          k--;
+        }
+        if (k < 0) start = -1e300;
+        k++;
+        v[k] = x;
+        z[k] = start;
+      }
+      if (k < 0) { std::fill(out, out + res, -1); continue; }  // unreachable: some column has a sample
+      int j = 0;
+      for (int x = 0; x < res; x++) {
+        while (j < k && z[j + 1] < x) j++;
+        out[x] = ss.pad[(size_t)ny[v[j]] * res + v[j]];
+      }
     }
-  }
+  });
+  ss.pad.swap(pad);
 }
 
 void to_image(const SampleSet& ss, const float* samples, int comps, float* out) {
@@ -239,8 +294,6 @@ void from_image(const SampleSet& ss, const float* img, int comps, float* out) {
 void denoise_samples(const SampleSet& ss, std::vector<float>& v) {
   if (ss.size() == 0) return;
   int res = ss.res;
-  std::vector<float> img((size_t)res * res);
-  to_image(ss, v.data(), 1, img.data());
   std::vector<float> out(ss.size());
   parallel_for((int64_t)ss.size(), [&](int64_t b, int64_t e) {
     for (int64_t i = b; i < e; i++) {
@@ -253,7 +306,7 @@ void denoise_samples(const SampleSet& ss, std::vector<float>& v) {
           // only blend with samples on the same triangle island neighborhood (avoid bleeding across UV gaps)
           int32_t src = ss.pad[ny * res + nx];
           if (src < 0 || length2(ss.pos[src] - ss.pos[i]) > 16.f * (ss.len_u[i] * ss.len_u[i] + ss.len_v[i] * ss.len_v[i])) continue;
-          s += img[ny * res + nx] * ww;
+          s += v[src] * ww;
           w += ww;
         }
       out[i] = w > 0 ? s / w : v[i];
@@ -263,22 +316,56 @@ void denoise_samples(const SampleSet& ss, std::vector<float>& v) {
 }
 
 // ---------------------------------------------------------------- AO & thickness
-// Evaluates a smooth, expensive per-sample quantity on a 2x2-subsampled texel lattice, then fills the
+// Indices of the non-zero entries of `pick`, ascending.
+static void compact(const std::vector<uint8_t>& pick, std::vector<uint32_t>& ids) {
+  const size_t kBlock = 1 << 16;
+  size_t n = pick.size(), blocks = (n + kBlock - 1) / kBlock;
+  std::vector<size_t> start(blocks + 1, 0);
+  parallel_for((int64_t)blocks, 1, [&](int64_t b, int64_t e) {
+    for (int64_t k = b; k < e; k++) {
+      size_t c = 0;
+      for (size_t i = k * kBlock, end = std::min(n, i + kBlock); i < end; i++) c += pick[i] != 0;
+      start[k + 1] = c;
+    }
+  });
+  for (size_t k = 0; k < blocks; k++) start[k + 1] += start[k];
+  ids.resize(start[blocks]);
+  parallel_for((int64_t)blocks, 1, [&](int64_t b, int64_t e) {
+    for (int64_t k = b; k < e; k++) {
+      size_t o = start[k];
+      for (size_t i = k * kBlock, end = std::min(n, i + kBlock); i < end; i++) if (pick[i]) ids[o++] = (uint32_t)i;
+    }
+  });
+}
+
+// Evaluates smooth, expensive per-sample quantities on a 2x2-subsampled texel lattice, then fills the
 // remaining samples by bilinear interpolation from lattice neighbors that are close in 3D and share
 // the normal; anything else (creases, island borders, thin features) is computed exactly. ~3.5x fewer rays.
-template <class F>
-static void eval_subsampled(const SampleSet& ss, std::vector<float>& out, F&& compute) {
+// compute(ids, values) evaluates a batch of samples exactly: values[k][j] is map k at sample ids[j].
+template <size_t K, class F>
+static void eval_subsampled(const SampleSet& ss, const std::array<std::vector<float>*, K>& out, F&& compute) {
   int res = ss.res;
   size_t n = ss.size();
-  out.assign(n, 0.f);
-  std::vector<uint8_t> is_prim(n, 0);
-  for (size_t i = 0; i < n; i++) {
-    int t = ss.texel[i];
-    is_prim[i] = ((t % res) % 2 == 0) && ((t / res) % 2 == 0);
-  }
-  parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
-    for (int64_t i = b; i < e; i++) if (is_prim[i]) out[i] = compute((size_t)i);
+  for (auto* o : out) o->assign(n, 0.f);
+  std::vector<uint8_t> is_prim(n, 0), exact(n, 0);
+  std::vector<uint32_t> ids;
+  std::array<std::vector<float>, K> vals;
+  auto run = [&](const std::vector<uint8_t>& pick) {
+    compact(pick, ids);
+    for (auto& v : vals) v.resize(ids.size());
+    compute(ids, vals);
+    parallel_for((int64_t)ids.size(), [&](int64_t b, int64_t e) {
+      for (int64_t j = b; j < e; j++)
+        for (size_t k = 0; k < K; k++) (*out[k])[ids[j]] = vals[k][j];
+    });
+  };
+  parallel_for((int64_t)n, [&](int64_t b, int64_t e) {
+    for (int64_t i = b; i < e; i++) {
+      int t = ss.texel[i];
+      is_prim[i] = ((t % res) % 2 == 0) && ((t / res) % 2 == 0);
+    }
   });
+  run(is_prim);
   parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
     for (int64_t i = b; i < e; i++) {
       if (is_prim[i]) continue;
@@ -286,7 +373,7 @@ static void eval_subsampled(const SampleSet& ss, std::vector<float>& out, F&& co
       int x0 = x & ~1, y0 = y & ~1;
       float fx = (x - x0) * 0.5f, fy = (y - y0) * 0.5f;
       float lim = 3.f * std::fmax(ss.len_u[i], ss.len_v[i]);
-      float acc = 0, wsum = 0;
+      float acc[K] = {}, wsum = 0;
       for (int k = 0; k < 4; k++) {
         int cx = x0 + (k & 1) * 2, cy = y0 + (k >> 1) * 2;
         float w = ((k & 1) ? fx : 1.f - fx) * ((k >> 1) ? fy : 1.f - fy);
@@ -294,12 +381,17 @@ static void eval_subsampled(const SampleSet& ss, std::vector<float>& out, F&& co
         int32_t s = ss.pad[(size_t)cy * res + cx];
         if (s < 0 || ss.texel[s] != cy * res + cx || !is_prim[s]) continue;
         if (length2(ss.pos[s] - ss.pos[i]) > lim * lim || dot(ss.nrm[s], ss.nrm[i]) < 0.97f) continue;
-        acc += out[s] * w;
+        for (size_t m = 0; m < K; m++) acc[m] += (*out[m])[s] * w;
         wsum += w;
       }
-      out[i] = wsum > 0.6f ? acc / wsum : compute((size_t)i);
+      if (wsum > 0.6f) {
+        for (size_t m = 0; m < K; m++) (*out[m])[i] = acc[m] / wsum;
+      } else {
+        exact[i] = 1;
+      }
     }
   });
+  run(exact);
 }
 
 static inline float radical_inverse(uint32_t b) {
@@ -311,65 +403,91 @@ static inline float radical_inverse(uint32_t b) {
   return (float)b * 2.3283064365386963e-10f;
 }
 
-static void bake_ao(const Mesh& m, const BVH& bvh, SampleSet& ss, const BakeSettings& s) {
+// AO and thickness of the low poly, traced on the GPU (`scene` holds the low-poly BVH) or, with gpu == null,
+// on all cores. The surface kernel in shaders/bake.hlsl mirrors the two estimators here.
+static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, const BakeSettings& s, Gpu* gpu, const GpuScene& scene) {
   float ext = m.max_extent();
-  float maxd = s.ao_distance * ext;
   float eps = ext * 2e-5f;
-  int N = s.ao_samples;
-  eval_subsampled(ss, ss.ao, [&](size_t i) -> float {
-    {
-      vec3 n = ss.nrm[i], fn = ss.fnrm[i];
-      vec3 o = ss.pos[i] + fn * eps + n * eps;
-      vec3 t, bt;
-      onb(n, t, bt);
-      float r1 = hash_float((uint32_t)i * 2u + 17u), r2 = hash_float((uint32_t)i * 2u + 91u);
-      int hits = 0, valid = 0;
-      for (int k = 0; k < N; k++) {
-        float u1 = (k + r1) / N;
-        float u2 = radical_inverse((uint32_t)k) + r2;
-        u2 -= std::floor(u2);
-        float r = std::sqrt(u1), phi = 2.f * kPi * u2;
-        vec3 d = t * (r * std::cos(phi)) + bt * (r * std::sin(phi)) + n * std::sqrt(std::fmax(0.f, 1.f - u1));
-        if (dot(d, fn) < 0.01f) continue;
-        valid++;
-        if (bvh.occluded(o, d, 0.f, maxd)) hits++;
-      }
-      return valid ? 1.f - (float)hits / valid : 1.f;
+  float ao_maxd = s.ao_distance * ext, th_maxd = s.thickness_distance * ext;
+  int ao_n = s.ao_samples, th_n = s.thickness_samples;
+  auto ao_value = [&](int hits, int valid) { return valid ? 1.f - (float)hits / valid : 1.f; };
+  auto thickness_value = [&](float sum) { return saturate(sum / (th_n * th_maxd)); };
+  auto ao = [&](size_t i) {
+    vec3 n = ss.nrm[i], fn = ss.fnrm[i];
+    vec3 o = ss.pos[i] + fn * eps + n * eps;
+    vec3 t, bt;
+    onb(n, t, bt);
+    float r1 = hash_float((uint32_t)i * 2u + 17u), r2 = hash_float((uint32_t)i * 2u + 91u);
+    int hits = 0, valid = 0;
+    for (int k = 0; k < ao_n; k++) {
+      float u1 = (k + r1) / ao_n;
+      float u2 = radical_inverse((uint32_t)k) + r2;
+      u2 -= std::floor(u2);
+      float r = std::sqrt(u1), phi = 2.f * kPi * u2;
+      vec3 d = t * (r * std::cos(phi)) + bt * (r * std::sin(phi)) + n * std::sqrt(std::fmax(0.f, 1.f - u1));
+      if (dot(d, fn) < 0.01f) continue;
+      valid++;
+      if (bvh.occluded(o, d, 0.f, ao_maxd)) hits++;
     }
-  });
-  denoise_samples(ss, ss.ao);
-}
-
-static void bake_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, const BakeSettings& s) {
-  float ext = m.max_extent();
-  float maxd = s.thickness_distance * ext;
-  float eps = ext * 2e-5f;
-  int N = s.thickness_samples;
-  eval_subsampled(ss, ss.thickness, [&](size_t i) -> float {
-    {
-      vec3 n = -ss.nrm[i], fn = -ss.fnrm[i];
-      vec3 o = ss.pos[i] + fn * eps;
-      vec3 t, bt;
-      onb(n, t, bt);
-      float r1 = hash_float((uint32_t)i * 2u + 7u), r2 = hash_float((uint32_t)i * 2u + 3u);
-      float sum = 0;
-      int valid = 0;
-      for (int k = 0; k < N; k++) {
-        float u1 = (k + r1) / N;
-        float u2 = radical_inverse((uint32_t)k) + r2;
-        u2 -= std::floor(u2);
-        // narrower cone than AO (thickness measures "straight through")
-        float ct = 1.f - u1 * 0.6f, st = std::sqrt(std::fmax(0.f, 1.f - ct * ct)), phi = 2.f * kPi * u2;
-        vec3 d = t * (st * std::cos(phi)) + bt * (st * std::sin(phi)) + n * ct;
-        float th, uu, vv;
-        uint32_t tri;
-        valid++;
-        sum += bvh.intersect(o, d, 0.f, maxd, th, tri, uu, vv) ? th : maxd;
-      }
-      return valid ? saturate(sum / (valid * maxd)) : 1.f;
+    return ao_value(hits, valid);
+  };
+  auto thickness = [&](size_t i) {
+    vec3 n = -ss.nrm[i], fn = -ss.fnrm[i];
+    vec3 o = ss.pos[i] + fn * eps;
+    vec3 t, bt;
+    onb(n, t, bt);
+    float r1 = hash_float((uint32_t)i * 2u + 7u), r2 = hash_float((uint32_t)i * 2u + 3u);
+    float sum = 0;
+    for (int k = 0; k < th_n; k++) {
+      float u1 = (k + r1) / th_n;
+      float u2 = radical_inverse((uint32_t)k) + r2;
+      u2 -= std::floor(u2);
+      // narrower cone than AO (thickness measures "straight through")
+      float ct = 1.f - u1 * 0.6f, st = std::sqrt(std::fmax(0.f, 1.f - ct * ct)), phi = 2.f * kPi * u2;
+      vec3 d = t * (st * std::cos(phi)) + bt * (st * std::sin(phi)) + n * ct;
+      float th, uu, vv;
+      uint32_t tri;
+      sum += bvh.intersect(o, d, 0.f, th_maxd, th, tri, uu, vv) ? th : th_maxd;
     }
+    return thickness_value(sum);
+  };
+  eval_subsampled<2>(ss, {&ss.ao, &ss.thickness}, [&](const std::vector<uint32_t>& ids, std::array<std::vector<float>, 2>& out) {
+    if (!gpu) {
+      parallel_for((int64_t)ids.size(), 64, [&](int64_t b, int64_t e) {
+        for (int64_t j = b; j < e; j++) out[0][j] = ao(ids[j]);
+      });
+      parallel_for((int64_t)ids.size(), 64, [&](int64_t b, int64_t e) {
+        for (int64_t j = b; j < e; j++) out[1][j] = thickness(ids[j]);
+      });
+      return;
+    }
+    GpuParams p;
+    p.eps = eps;
+    p.samples = (uint32_t)ao_n;
+    p.maxd = ao_maxd;
+    p.thickness_samples = (uint32_t)th_n;
+    p.thickness_maxd = th_maxd;
+    gpu_run(*gpu, GpuKernel::Surface, p, scene, ids.size(), sizeof(GpuSample), sizeof(GpuSurfaceOut),
+            [&](size_t first, size_t count, void* dst) {
+              GpuSample* r = (GpuSample*)dst;
+              parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
+                for (int64_t j = b; j < e; j++) {
+                  uint32_t i = ids[first + j];
+                  r[j] = {ss.pos[i], i, ss.nrm[i], 0.f, ss.fnrm[i], 0.f};
+                }
+              });
+            },
+            [&](size_t first, size_t count, const void* src) {
+              const GpuSurfaceOut* r = (const GpuSurfaceOut*)src;
+              for (size_t j = 0; j < count; j++) {
+                out[0][first + j] = ao_value((int)(r[j].ao >> 16), (int)(r[j].ao & 0xffffu));
+                out[1][first + j] = thickness_value(r[j].thickness);
+              }
+            });
   });
-  denoise_samples(ss, ss.thickness);
+  parallel_for(2, 1, [&](int64_t b, int64_t e) {
+    for (int64_t k = b; k < e; k++) denoise_samples(ss, k == 0 ? ss.ao : ss.thickness);
+  });
 }
 
 // ---------------------------------------------------------------- curvature
@@ -454,10 +572,22 @@ static void bake_curvature(const Mesh& m, const EdgeSamples& es, std::vector<Sam
     start[cell_id[i] + 1]++;
   }
   for (size_t c = 0; c < ncell; c++) start[c + 1] += start[c];
-  std::vector<uint32_t> order(es.p.size());
+  // edge samples in cell order, and whether a cell has any within reach (most texels are nowhere near an edge)
+  std::vector<vec3> sp(es.p.size()), sn(es.p.size());
+  std::vector<float> sw(es.p.size());
+  std::vector<uint8_t> reach(ncell, 0);
   {
     std::vector<uint32_t> fill(start.begin(), start.end() - 1);
-    for (size_t i = 0; i < es.p.size(); i++) order[fill[cell_id[i]]++] = (uint32_t)i;
+    for (size_t i = 0; i < es.p.size(); i++) {
+      uint32_t k = fill[cell_id[i]]++;
+      sp[k] = es.p[i];
+      sn[k] = es.n[i];
+      sw[k] = es.w[i];
+      int cx = (int)(cell_id[i] % gx), cy = (int)(cell_id[i] / gx % gy), cz = (int)(cell_id[i] / ((size_t)gx * gy));
+      for (int z = std::max(0, cz - 1); z <= std::min(gz - 1, cz + 1); z++)
+        for (int y = std::max(0, cy - 1); y <= std::min(gy - 1, cy + 1); y++)
+          for (int x = std::max(0, cx - 1); x <= std::min(gx - 1, cx + 1); x++) reach[((size_t)z * gy + y) * gx + x] = 1;
+    }
   }
   float r2 = r * r;
   float norm = 3.f / (kPi * r2);  // 1 / integral of (1-d^2/r^2)^2 over the disk
@@ -468,18 +598,18 @@ static void bake_curvature(const Mesh& m, const EdgeSamples& es, std::vector<Sam
         vec3 p = ss->pos[i], n = ss->nrm[i];
         int cx, cy, cz;
         cell_of(p, cx, cy, cz);
+        if (!reach[((size_t)cz * gy + cy) * gx + cx]) continue;  // flat: stays 0.5
         float acc = 0;
         for (int z = std::max(0, cz - 1); z <= std::min(gz - 1, cz + 1); z++)
           for (int y = std::max(0, cy - 1); y <= std::min(gy - 1, cy + 1); y++)
             for (int x = std::max(0, cx - 1); x <= std::min(gx - 1, cx + 1); x++) {
               size_t c = ((size_t)z * gy + y) * gx + x;
               for (uint32_t k = start[c]; k < start[c + 1]; k++) {
-                uint32_t si = order[k];
-                float d2 = length2(p - es.p[si]);
+                float d2 = length2(p - sp[k]);
                 if (d2 >= r2) continue;
-                if (dot(es.n[si], n) < -0.05f) continue;  // other side of a thin wall
+                if (dot(sn[k], n) < -0.05f) continue;  // other side of a thin wall
                 float w = 1.f - d2 / r2;
-                acc += w * w * es.w[si];
+                acc += w * w * sw[k];
               }
             }
         float c = acc * norm * r * s.curvature_gain;
@@ -492,54 +622,113 @@ static void bake_curvature(const Mesh& m, const EdgeSamples& es, std::vector<Sam
 // ---------------------------------------------------------------- disk cache
 static std::string cache_path(const std::string& dir, uint64_t key) { return path_join(dir, strf("bake-%016llx.bin", (unsigned long long)key)); }
 
+// The maps are read and written straight from the sample arrays: a 4K project is hundreds of megabytes.
 static bool load_cache(const std::string& path, std::vector<SampleSet>& sets) {
-  std::string data;
-  if (!read_file(path, data)) return false;
-  const char* p = data.data();
-  const char* end = p + data.size();
-  auto rd = [&](void* dst, size_t n) {
-    if ((size_t)(end - p) < n) return false;
-    memcpy(dst, p, n);
-    p += n;
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  auto rd = [&](void* dst, size_t n) { return n == 0 || fread(dst, 1, n, f) == n; };
+  auto load = [&] {
+    uint32_t magic = 0, count = 0;
+    if (!rd(&magic, 4) || magic != 0x32544150u || !rd(&count, 4) || count != sets.size()) return false;
+    for (auto& ss : sets) {
+      uint64_t n = 0, nn = 0;
+      if (!rd(&n, 8) || n != ss.size()) return false;
+      ss.ao.resize(n); ss.thickness.resize(n); ss.curvature.resize(n);
+      if (!rd(ss.ao.data(), n * 4) || !rd(ss.thickness.data(), n * 4) || !rd(ss.curvature.data(), n * 4)) return false;
+      if (!rd(&nn, 8) || (nn != 0 && nn != n)) return false;
+      ss.nmap.resize(nn); ss.nmiss.resize(nn);
+      if (!rd(ss.nmap.data(), nn * sizeof(vec3)) || !rd(ss.nmiss.data(), nn)) return false;
+    }
     return true;
   };
-  uint32_t magic = 0, count = 0;
-  if (!rd(&magic, 4) || magic != 0x32544150u || !rd(&count, 4) || count != sets.size()) return false;
-  for (auto& ss : sets) {
-    uint64_t n = 0, nn = 0;
-    if (!rd(&n, 8) || n != ss.size()) return false;
-    ss.ao.resize(n); ss.thickness.resize(n); ss.curvature.resize(n);
-    if (!rd(ss.ao.data(), n * 4) || !rd(ss.thickness.data(), n * 4) || !rd(ss.curvature.data(), n * 4)) return false;
-    if (!rd(&nn, 8) || (nn != 0 && nn != n)) return false;
-    ss.nmap.resize(nn); ss.nmiss.resize(nn);
-    if (nn && (!rd(ss.nmap.data(), nn * sizeof(vec3)) || !rd(ss.nmiss.data(), nn))) return false;
-  }
-  return true;
+  bool ok = load();
+  fclose(f);
+  if (!ok)  // a damaged file: leave no half-read maps behind
+    for (auto& ss : sets) { ss.ao.clear(); ss.thickness.clear(); ss.curvature.clear(); ss.nmap.clear(); ss.nmiss.clear(); }
+  return ok;
 }
 
 static void save_cache(const std::string& path, const std::vector<SampleSet>& sets) {
-  std::string out;
-  uint32_t magic = 0x32544150u, count = (uint32_t)sets.size();
-  out.append((const char*)&magic, 4);
-  out.append((const char*)&count, 4);
-  for (auto& ss : sets) {
-    uint64_t n = ss.size();
-    out.append((const char*)&n, 8);
-    out.append((const char*)ss.ao.data(), n * 4);
-    out.append((const char*)ss.thickness.data(), n * 4);
-    out.append((const char*)ss.curvature.data(), n * 4);
-    uint64_t nn = ss.nmap.size();
-    out.append((const char*)&nn, 8);
-    out.append((const char*)ss.nmap.data(), nn * sizeof(vec3));
-    out.append((const char*)ss.nmiss.data(), nn);
-  }
   make_dirs(path_dir(path));
-  write_file_or_throw(path, out);
+  // write to a temp file then rename, so concurrent readers never see partial files
+  std::string tmp = path + strf(".tmp%u", (unsigned)hash_u32((uint32_t)(now_seconds() * 1e6)));
+  FILE* f = fopen(tmp.c_str(), "wb");
+  if (!f) fail("cannot write '%s'", path.c_str());
+  bool ok = true;
+  auto wr = [&](const void* src, size_t n) { ok = ok && (n == 0 || fwrite(src, 1, n, f) == n); };
+  uint32_t magic = 0x32544150u, count = (uint32_t)sets.size();
+  wr(&magic, 4);
+  wr(&count, 4);
+  for (auto& ss : sets) {
+    uint64_t n = ss.size(), nn = ss.nmap.size();
+    wr(&n, 8);
+    wr(ss.ao.data(), n * 4);
+    wr(ss.thickness.data(), n * 4);
+    wr(ss.curvature.data(), n * 4);
+    wr(&nn, 8);
+    wr(ss.nmap.data(), nn * sizeof(vec3));
+    wr(ss.nmiss.data(), nn);
+  }
+  ok = fclose(f) == 0 && ok;
+  std::error_code ec;
+  if (ok) std::filesystem::rename(tmp, path, ec);
+  if (!ok || ec) {
+    std::filesystem::remove(tmp, ec);
+    fail("cannot write '%s'", path.c_str());
+  }
 }
 
+// Cache files are written by one background thread: a disk takes longer over a big bake than the GPU does,
+// and nothing waits for the file. Queued writes finish before the process exits.
+namespace {
+struct CacheWriter {
+  std::mutex m;
+  std::condition_variable cv;
+  std::deque<std::pair<std::string, std::shared_ptr<const Baked>>> queue;
+  std::thread thread;
+  bool quit = false;
+
+  static CacheWriter& get() {
+    static CacheWriter* w = new CacheWriter;  // intentionally leaked: lives for the process
+    return *w;
+  }
+  void push(const std::string& path, std::shared_ptr<const Baked> bk) {
+    std::lock_guard<std::mutex> lk(m);
+    if (!thread.joinable()) {
+      thread = std::thread([this] { run(); });
+      std::atexit([] { CacheWriter::get().finish(); });
+    }
+    queue.emplace_back(path, std::move(bk));
+    cv.notify_all();
+  }
+  void run() {
+    std::unique_lock<std::mutex> lk(m);
+    for (;;) {
+      cv.wait(lk, [&] { return quit || !queue.empty(); });
+      if (queue.empty()) return;
+      auto job = std::move(queue.front());
+      queue.pop_front();
+      lk.unlock();
+      try { save_cache(job.first, job.second->sets); } catch (const std::exception&) { /* the cache is best-effort */ }
+      job.second.reset();
+      lk.lock();
+    }
+  }
+  void finish() {
+    { std::lock_guard<std::mutex> lk(m); quit = true; }
+    cv.notify_all();
+    if (thread.joinable()) thread.join();
+  }
+};
+}  // namespace
+
 // ---------------------------------------------------------------- entry
+// Auto bakes on the GPU from this many texels (all texture sets together): a smaller bake is done on the CPU
+// before a GPU driver has even started.
+static constexpr int64_t kGpuMinTexels = 512 * 512;
+
 std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::vector<int>& res_per_set, const BakeSettings& s,
-                                 const std::string& cache_dir, bool force) {
+                                 const std::string& cache_dir, bool force, BakeDevice device) {
   const Mesh& m = *mesh;
   auto bk = std::make_shared<Baked>();
   bk->mesh = mesh;
@@ -547,8 +736,12 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
   Json stats = Json::object();
   Timer total;
 
+  int64_t texels = 0;
+  for (int r : res_per_set) texels += (int64_t)r * r;
+  bool want_gpu = device == BakeDevice::Gpu || (device == BakeDevice::Auto && texels >= kGpuMinTexels && Gpu::enabled());
+
   // bump when baker output changes so stale disk caches are never reused
-  static const uint64_t kBakerVersion = 5;
+  static const uint64_t kBakerVersion = 6;
   uint64_t key = fnv1a(&kBakerVersion, sizeof kBakerVersion, m.content_hash ^ s.hash());
   for (int r : res_per_set) key = fnv1a(&r, sizeof r, key);
   std::shared_ptr<Mesh> high;
@@ -562,7 +755,20 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
     uint64_t h = fnv1a(bytes);
     key = fnv1a(&h, sizeof h, key);
   }
-  bk->key = key;
+  // GPU and CPU bakes differ in the last float bits, so each device keeps its own cache entry. Either one
+  // will do when it exists, and looking for the file first avoids starting the GPU just to find out.
+  auto device_key = [&](bool on_gpu) { uint8_t d = on_gpu; return fnv1a(&d, 1, key); };
+  bool on_gpu = false;
+  std::string cached_file;
+  if (!force && !cache_dir.empty())
+    for (bool d : {true, false}) {
+      std::string f = cache_path(cache_dir, device_key(d));
+      if ((d && !want_gpu) || !file_exists(f)) continue;
+      cached_file = f;
+      on_gpu = d;
+      break;
+    }
+  if (cached_file.empty() && want_gpu) Gpu::warm_up();  // the driver starts while the mesh is rasterized
 
   Timer t;
   bk->bvh.build(m.pos, m.idx);
@@ -580,28 +786,50 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
   }
   stats.set("raster_ms", t.ms());
 
-  bool cached = false;
-  std::string cpath = cache_dir.empty() ? "" : cache_path(cache_dir, key);
-  if (!force && !cpath.empty()) cached = load_cache(cpath, bk->sets);
+  Gpu* gpu = nullptr;
+  bool cached = !cached_file.empty() && load_cache(cached_file, bk->sets);
   if (!cached) {
-    t = Timer();
-    for (auto& ss : bk->sets) bake_ao(m, bk->bvh, ss, s);
-    stats.set("ao_ms", t.ms());
-    t = Timer();
-    for (auto& ss : bk->sets) bake_thickness(m, bk->bvh, ss, s);
-    stats.set("thickness_ms", t.ms());
-    t = Timer();
-    EdgeSamples es = curvature_edges(m, s.curvature_radius * m.max_extent(), s.curvature_min_angle);
-    std::vector<SampleSet*> ptrs;
-    for (auto& ss : bk->sets) ptrs.push_back(&ss);
-    bake_curvature(m, es, ptrs, s);
-    stats.set("curvature_ms", t.ms());
-    stats.set("curvature_edge_samples", (int64_t)es.p.size());
-    if (s.normal.active()) bake_normals(*bk, high.get(), s, stats);
-    if (!cpath.empty()) {
-      try { save_cache(cpath, bk->sets); } catch (const std::exception&) { /* cache is best-effort */ }
+    // curvature never touches the GPU, so it goes first: by now the driver is usually still starting
+    auto bake_geometry = [&] {
+      Timer t;
+      EdgeSamples es = curvature_edges(m, s.curvature_radius * m.max_extent(), s.curvature_min_angle);
+      std::vector<SampleSet*> ptrs;
+      for (auto& ss : bk->sets) ptrs.push_back(&ss);
+      bake_curvature(m, es, ptrs, s);
+      stats.set("curvature_ms", t.ms());
+      stats.set("curvature_edge_samples", (int64_t)es.p.size());
+    };
+    auto bake_traced = [&](Gpu* on) {
+      GpuScene low;
+      if (on) {
+        low.add(bk->bvh);
+        low.upload(*on);
+      }
+      Timer t;
+      for (auto& ss : bk->sets) bake_ao_thickness(m, bk->bvh, ss, s, on, low);
+      stats.set("ao_thickness_ms", t.ms());
+      if (s.normal.active()) bake_normals(*bk, high.get(), s, stats, on);
+    };
+    bake_geometry();
+    if (want_gpu) gpu = Gpu::get();
+    if (device == BakeDevice::Gpu && !gpu) fail("no GPU to bake on: %s", Gpu::unavailable_reason().c_str());
+    try {
+      bake_traced(gpu);
+    } catch (const GpuError& e) {
+      // driver reset, out of video memory...: every map is rebuilt from scratch on the CPU
+      if (device == BakeDevice::Gpu) throw;
+      stats.set("gpu_error", e.what());
+      gpu = nullptr;
+      bake_geometry();  // the normal bake had started adding to the curvature
+      bake_traced(nullptr);
     }
+    if (gpu) gpu->trim();
+    on_gpu = gpu != nullptr;
+    if (!cache_dir.empty()) CacheWriter::get().push(cache_path(cache_dir, device_key(on_gpu)), bk);
   }
+  bk->key = device_key(on_gpu);
+  stats.set("device", on_gpu ? "gpu" : "cpu");  // which device traced the maps (also when they came from the cache)
+  if (gpu) stats.set("gpu", strf("%s (%s)", gpu->name().c_str(), gpu->backend()));
   stats.set("from_cache", cached);
   Json sets = Json::object();
   for (auto& ss : bk->sets) {

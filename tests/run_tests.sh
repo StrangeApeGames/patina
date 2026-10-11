@@ -110,6 +110,28 @@ painted=$("$BIN" bake "$W/bake_painted.patina.json" --force --compact | json "d[
 "$PY" -c "import sys; sys.exit(0 if float('$painted') < float('$tight') and float('$tight') > 0 else 1)" || fail "painted cage should fix misses ($tight -> $painted)"
 ok "explicit cage mesh, painted cage mask, AO from the high poly"
 
+# GPU baker: `bake --verify` bakes on the GPU and on the CPU and compares every map. Runs on this machine's GPU
+# when it has one, otherwise on Direct3D's software rasterizer (CI), and is skipped where there is no backend.
+gpu_of() { "$BIN" bake "$1" --verify --compact | json "d['verify']['gpu']"; }
+gpu_env=${PATINA_GPU-}
+[ "$(gpu_of "$W/crate.patina.json")" != "None" ] || export PATINA_GPU=warp
+if [ "$(gpu_of "$W/crate.patina.json")" != "None" ]; then
+  for p in crate bake bake_fixed bake_cage bevel; do  # AO + thickness, projection (auto skew, fixed skew, cage mesh), bevel
+    out=$("$BIN" bake "$W/$p.patina.json" --verify --compact)
+    [ "$(echo "$out" | json "d['verify']['ok']")" = "True" ] || fail "GPU and CPU bakes of $p differ: $out"
+  done
+  [ "$("$BIN" bake "$W/crate.patina.json" --force --compact | json "d['stats']['device']")" = "gpu" ] || fail "bake should use the GPU"
+  [ "$("$BIN" bake "$W/crate.patina.json" --compact | json "(d['stats']['device'], d['stats']['from_cache'])")" = "('gpu', True)" ] || fail "GPU bake cache"
+  [ "$(PATINA_GPU=0 "$BIN" bake "$W/crate.patina.json" --compact | json "d['stats']['device']")" = "cpu" ] || fail "PATINA_GPU=0 must bake on the CPU"
+  ok "GPU baker matches the CPU baker ($(gpu_of "$W/crate.patina.json"))"
+else
+  why=$("$BIN" bake "$W/crate.patina.json" --verify --compact | json "d['verify']['reason']")
+  # a Windows build must have the backend: without fxc at configure time it is left out with only a warning
+  case "$(uname -s):$why" in MINGW*backend*|MSYS*backend*|CYGWIN*backend*) fail "Windows build without the GPU baker: $why" ;; esac
+  echo "  skip GPU baker ($why)"
+fi
+[ -n "$gpu_env" ] && export PATINA_GPU=$gpu_env || unset PATINA_GPU
+
 # example project: UV-space wood grain, mask range, all three lighting environments
 [ "$("$BIN" validate examples/projects/barrel.patina.json --compact | json "d['ok']")" = "True" ] || fail "validate barrel example"
 [ "$("$BIN" validate examples/projects/beer_barrel.patina.json --compact | json "d['ok']")" = "True" ] || fail "validate beer barrel example"

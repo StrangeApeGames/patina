@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(patina VERSION 0.3.3 LANGUAGES C CXX)
+project(patina VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +33,7 @@ add_library(patina_core STATIC
   src/bvh.cpp
   src/bake.cpp
   src/bake_normal.cpp
+  src/bake_gpu.cpp
   src/noise.cpp
   src/image.cpp
   src/eval.cpp
@@ -65,6 +66,33 @@ patina_embed(${CMAKE_SOURCE_DIR}/tools/blender/patina_blender.py patina_blender)
 patina_embed(${CMAKE_SOURCE_DIR}/third_party/hdri/studio_small_09_1k.hdr patina_studio_hdri)
 target_include_directories(patina_core PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_compile_definitions(patina_core PUBLIC PATINA_VERSION="${PROJECT_VERSION}")
+
+# GPU baker (src/gpu.h). Windows: Direct3D 11 compute kernels, compiled here by the Windows SDK's fxc (it sits
+# next to rc.exe) into one bytecode header each, so nothing is compiled at run time. Other platforms, or a
+# Windows toolchain without fxc, build the CPU baker only.
+if(WIN32)
+  get_filename_component(PATINA_SDK_BIN "${CMAKE_RC_COMPILER}" DIRECTORY)
+  find_program(PATINA_FXC fxc HINTS "${PATINA_SDK_BIN}" "$ENV{WindowsSdkVerBinPath}/x64")
+endif()
+if(WIN32 AND PATINA_FXC)
+  target_sources(patina_core PRIVATE src/gpu_d3d11.cpp)
+  foreach(kernel surface ao_high project bevel)
+    string(TOUPPER ${kernel} KERNEL)
+    set(out ${CMAKE_BINARY_DIR}/generated/bake_${kernel}.h)
+    add_custom_command(OUTPUT ${out}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
+      COMMAND ${PATINA_FXC} /nologo /T cs_5_0 /E main /O3 /D KERNEL_${KERNEL}=1 /Vn g_bake_${kernel} /Fh ${out}
+              ${CMAKE_SOURCE_DIR}/src/shaders/bake.hlsl
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/shaders/bake.hlsl VERBATIM)
+    target_sources(patina_core PRIVATE ${out})
+    set_source_files_properties(${out} PROPERTIES HEADER_FILE_ONLY TRUE)
+  endforeach()
+else()
+  if(WIN32)
+    message(WARNING "fxc.exe (Windows SDK) not found: building without the GPU baker")
+  endif()
+  target_sources(patina_core PRIVATE src/gpu_none.cpp)
+endif()
 target_link_libraries(patina_core PUBLIC patina_thirdparty)
 find_package(Threads REQUIRED)
 target_link_libraries(patina_core PUBLIC Threads::Threads)

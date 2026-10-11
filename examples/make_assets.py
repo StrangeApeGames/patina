@@ -667,7 +667,7 @@ def build_boltplate_cage():
         bm = _box_bm(*size, cz=cz)
         bm.normal_update()
         for v in bm.verts:
-            v.co += v.normal * 0.03
+            v.co += v.normal * 0.035                # 0.02 above the faces: clears the 0.018 bolt heads
         o = object_from_bmesh(name, bm, [m])
         o.data.shade_flat()
         o["patina_skip_uv"] = True
