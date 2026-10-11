@@ -73,6 +73,94 @@ for f in "$W"/det1/*.png "$W"/det1/*.glb; do
 done
 ok "exports are bit-identical across runs (including a forced re-bake)"
 
+# USD export through LightUSD: text, binary and one-file package. The mesh has one part with two materials, which
+# USD binds through GeomSubsets, names that are not valid USD prim names, and (being an OBJ) a "Default" texture
+# set with no triangles, which must get no material.
+cat > "$W/usd_mesh.obj" <<'EOF'
+o Body.001
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+vt 0.05 0.05
+vt 0.45 0.05
+vt 0.45 0.45
+vt 0.05 0.45
+vn 0 0 1
+usemtl Wood Planks
+f 1/1/1 2/2/1 3/3/1
+usemtl 2nd-Iron
+f 1/1/1 3/3/1 4/4/1
+o Lid
+v 0 0 1
+v 1 0 1
+v 0 1 1
+vt 0.55 0.55
+vt 0.95 0.55
+vt 0.55 0.95
+f 5/5/1 6/6/1 7/7/1
+EOF
+"$BIN" new "$W/usd.patina.json" --mesh "$W/usd_mesh.obj" --resolution 64 --smart painted_metal --compact >/dev/null || fail "new usd project"
+"$BIN" edit "$W/usd.patina.json" '[{"op":"add","set":"Wood Planks","layer":{"id":"glow","channels":{"emissive":"#ff8800","opacity":0.5}}}]' --compact >/dev/null || fail "edit usd project"
+set +e; out=$("$BIN" export "$W/usd.patina.json" --preset gltf --usd --out "$W/usd_a" --compact); set -e
+if echo "$out" | grep -q "no USD export"; then
+  # the submodule was not checked out, or -DPATINA_USD=OFF. A CI build must have it.
+  [ -z "${CI:-}" ] || fail "CI build without USD export"
+  echo "  skip USD export (this build has no LightUSD)"
+else
+  # 2 meshes, 3 triangles, 2 materials, 7 images: base color, ORM and normal each, plus the glow's emissive.
+  # export itself reads every file back with LightUSD before it reports these.
+  usd_counts() { json "(d['usd']['format'], d['usd']['meshes'], d['usd']['triangles'], d['usd']['materials'], d['usd']['textures'], 'warnings' in d['usd'])"; }
+  [ "$(echo "$out" | usd_counts)" = "('usda', 2, 3, 2, 7, False)" ] || fail "usd export: $out"
+  [ "$(echo "$out" | json "d['usd']['path'] in d['files']")" = "True" ] || fail "usd file not listed"
+  for f in usdc usdz; do
+    out=$("$BIN" export "$W/usd.patina.json" --preset gltf --usd $f --out "$W/usd_a" --compact) || fail "export --usd $f: $out"
+    [ "$(echo "$out" | usd_counts)" = "('$f', 2, 3, 2, 7, False)" ] || fail "usd $f export: $out"
+  done
+  grep -q '"usd"' "$W/usd_a/manifest.json" || fail "usd missing from the manifest"
+  # the layout of each file, and OpenUSD itself (with its compliance checker) where a pxr module or Blender is installed
+  "$PY" tests/usd_check.py --expect 2,3,2,7 "$W/usd_a/usd.usda" "$W/usd_a/usd.usdc" "$W/usd_a/usd.usdz" || fail "usd files"
+  for want in 'def Mesh "Body_001"' 'displayName = "Body.001"' 'def GeomSubset "Wood_Planks"' 'def Material "_2nd_Iron"' \
+              'subsetFamily:materialBind:familyType = "partition"' 'inputs:scale = (2, 2, 2, 1)' 'inputs:opacity.connect' 'inputs:emissiveColor.connect'; do
+    grep -qF "$want" "$W/usd_a/usd.usda" || fail "usda has no: $want"
+  done
+  ! grep -q 'def Material "Default"' "$W/usd_a/usd.usda" || fail "a texture set with no triangles got a material"
+  # the Lid's own three points, and its UVs as the OBJ has them: an OBJ's V runs up the image like USD's, so a
+  # wrong flip between Patina's top-left UVs and USD's would show here
+  "$PY" - "$W/usd_a/usd.usda" <<'EOF' || fail "usd mesh data"
+import re, sys
+lid = open(sys.argv[1]).read().split('def Mesh "Lid"')[1]
+def values(decl):
+    return [float(v) for v in re.findall(r"-?\d+\.?\d*(?:e-?\d+)?", re.search(re.escape(decl) + r" = \[([^\]]*)\]", lid).group(1))]
+same = lambda got, want: len(got) == len(want) and all(abs(a - b) < 1e-6 for a, b in zip(got, want))
+ok = same(values("point3f[] points"), [0, 0, 1, 1, 0, 1, 0, 1, 1]) and same(values("normal3f[] normals"), [0, 0, 1] * 3) \
+    and same(values("texCoord2f[] primvars:st"), [0.55, 0.55, 0.95, 0.55, 0.55, 0.95]) and values("int[] faceVertexIndices") == [0, 1, 2]
+sys.exit(0 if ok else 1)
+EOF
+  for f in usda usdc usdz; do
+    "$BIN" export "$W/usd.patina.json" --preset gltf --usd $f --out "$W/usd_b" --compact >/dev/null
+    cmp -s "$W/usd_a/usd.$f" "$W/usd_b/usd.$f" || fail "non-deterministic output: usd.$f"
+  done
+  # other packings are read through the texture's scale and bias, and export says which importers may not follow
+  out=$("$BIN" export "$W/usd.patina.json" --preset unreal --usd --out "$W/usd_unreal" --compact)
+  grep -qF 'inputs:scale = (2, -2, 2, 1)' "$W/usd_unreal/usd.usda" || fail "DirectX normals must have green flipped"
+  [ "$(echo "$out" | json "len(d['usd']['warnings'])")" = "1" ] || fail "DirectX preset warning"
+  out=$("$BIN" export "$W/usd.patina.json" --preset unity_urp --usd --out "$W/usd_unity" --compact)
+  grep -qF 'inputs:roughness.connect = </usd/Materials/Wood_Planks/Texture_metallic_smoothness.outputs:a>' "$W/usd_unity/usd.usda" || fail "roughness from smoothness"
+  grep -qF 'inputs:scale = (1, 1, 1, -1)' "$W/usd_unity/usd.usda" || fail "smoothness must be inverted"
+  [ "$(echo "$out" | json "len(d['usd']['warnings'])")" = "1" ] || fail "smoothness preset warning"
+  out=$("$BIN" export "$W/usd.patina.json" --preset blender --usd usdc --out "$W/usd_blender" --compact)
+  [ "$(echo "$out" | usd_counts)" = "('usdc', 2, 3, 2, 12, False)" ] || fail "usd with separate maps: $out"
+  # exports run concurrently, and LightUSD must only ever be in one of them at a time
+  r=$("$BIN" batch --do export "$W/crate.patina.json" "$W/barrel.patina.json" "$W/usd.patina.json" --preset gltf --usd usdz -j 3 --compact | json "d['succeeded']")
+  [ "$r" = "3" ] || fail "concurrent usd exports"
+  # a flag after --usd is not its value, and a format that does not exist says which do
+  "$BIN" export "$W/usd.patina.json" --usd -o "$W/usd_flag" --compact >/dev/null && [ -f "$W/usd_flag/usd.usda" ] || fail "--usd followed by -o"
+  set +e; out=$("$BIN" export "$W/usd.patina.json" --usd usdx --out "$W/usd_bad" --compact); code=$?; set -e
+  [ $code -ne 0 ] && echo "$out" | grep -q "unknown usd format 'usdx'" || fail "unknown usd format must be reported"
+  ok "USD export: usda, usdc, usdz, material subsets, packed presets, deterministic"
+fi
+
 # batch in parallel
 "$BIN" new "$W/suzanne.patina.json" --mesh examples/assets/suzanne.glb --resolution 256 --smart leather --compact >/dev/null
 r=$("$BIN" batch --do render "$W/crate.patina.json" "$W/barrel.patina.json" "$W/suzanne.patina.json" --size 128 -j 3 --compact | json "d['succeeded']")

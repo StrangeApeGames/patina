@@ -67,6 +67,9 @@ calls = {
     16: ("variants", {"project": f"{WORK}/crate.patina.json", "size": 128, "variants": [
         {"label": "blue", "ops": [{"op": "update", "id": "painted_metal", "patch": {"params": {"color": "#224488"}}}]},
         {"label": "orange", "ops": [{"op": "update", "id": "painted_metal", "patch": {"params": {"color": "#dd7722", "wear": 0.8}}}]}]}),
+    # USD is written by LightUSD, which must not print to stdout (it is the protocol) or run in two calls at once
+    17: ("export", {"project": f"{WORK}/crate.patina.json", "preset": "gltf", "usd": "usdc"}),
+    18: ("export", {"project": f"{WORK}/barrel.patina.json", "preset": "gltf", "usd": "usdz"}),
 }
 for cid, (name, args) in calls.items():
     call(cid, name, args)
@@ -81,6 +84,12 @@ for i in (10, 11, 12, 13, 14, 16):
 assert results[15]["result"]["isError"]
 for i in (10, 11, 12, 16):
     assert results[i]["result"]["content"][1]["type"] == "image"
+for i in (17, 18):
+    text = results[i]["result"]["content"][0]["text"]
+    if results[i]["result"]["isError"]:
+        assert "no USD export" in text, text  # a build without the LightUSD submodule
+    else:
+        assert json.loads(text)["usd"]["meshes"] > 0, text
 p.stdin.close()
 p.wait(timeout=30)
 print("MCP smoke test passed")

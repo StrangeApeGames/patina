@@ -16,6 +16,7 @@
 #include "mesh.h"
 #include "project.h"
 #include "render.h"
+#include "usd.h"
 
 namespace pt {
 
@@ -542,18 +543,38 @@ CommandOutput cmd_variants(const Json& a) {
   return o;
 }
 
+// The "usd" argument of export: true writes text (.usda), a string names the format. "" when USD is not asked for.
+static std::string usd_format_arg(const Json& a) {
+  const Json* usd = a.find("usd");
+  if (!usd || usd->is_null() || (usd->is_bool() && !usd->as_bool())) return "";
+  if (!usd->is_bool() && !usd->is_string()) fail("\"usd\" must be true or a format: usda, usdc or usdz");
+  std::string format = usd->is_bool() ? "usda" : to_lower(usd->as_str());
+  if (!format.empty() && format[0] == '.') format.erase(0, 1);
+  std::vector<std::string> formats = usd_formats();
+  if (std::find(formats.begin(), formats.end(), format) == formats.end()) {
+    std::string dym = did_you_mean(format, formats);
+    fail("unknown usd format '%s'%s (usda = text, usdc = binary, usdz = one file with the textures inside)", format.c_str(),
+         dym.empty() ? "" : (" - did you mean '" + dym + "'?").c_str());
+  }
+  if (!usd_available())
+    fail("this build has no USD export: it was built without the third_party/LightUSD submodule (git submodule update --init) "
+         "or with -DPATINA_USD=OFF");
+  return format;
+}
+
 CommandOutput cmd_export(const Json& a) {
   Timer total;
   Project p = load_project_arg(a);
   std::string preset = a.str("preset", p.doc["export"].str("preset", "blender"));
   std::string out = a.str("out", p.resolve(p.doc["export"].str("dir", "textures/" + sanitize_filename(p.name()))));
+  std::string usd_format = usd_format_arg(a);  // before the bake, so a typo fails at once
   int res = a.integer("resolution", 0);
   Json bake_stats;
   auto bk = get_bake(p, res, false, &bake_stats);
   EvalOptions opt;
   Json eval_stats, warnings;
   auto results = evaluate_all(p, *bk, opt, &eval_stats, &warnings);
-  Json r = export_textures(p, *bk, results, preset, out, a.boolean("glb", false));
+  Json r = export_textures(p, *bk, results, preset, out, a.boolean("glb", false), usd_format);
   r.set("warnings", warnings);
   r.set("bake_ms", bake_stats.num("total_ms", 0));
   r.set("eval", eval_stats);

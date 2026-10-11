@@ -28,7 +28,7 @@ Substance Painter is built for people with a mouse. Agents need:
 | Bakes that don't interrupt the loop | A **GPU baker**: AO, thickness, the high-to-low projection and the bevel are ray traced in compute shaders, about 10x faster than 32 CPU threads end to end, with an automatic CPU fallback and `bake --verify` to compare the two. |
 | No UV seams | **3D procedural noise evaluated at the surface position**, so noise is seamless across seams. |
 | Normal maps without the fuss | A **high-to-low normal baker** with automatic cage, automatic anti-skew and `_low`/`_high` name matching (no bleed between parts), plus a **bevel shader** that bakes rounded edges from the low poly alone. MikkTSpace throughout. |
-| Engine-ready output | Export presets for Blender, glTF (ORM), Unreal, Unity HDRP/URP and Godot, plus a textured `.glb` and a Blender bridge that builds the materials. |
+| Engine-ready output | Export presets for Blender, glTF (ORM), Unreal, Unity HDRP/URP and Godot, plus a textured `.glb`, the mesh as **USD** (`.usda`, `.usdc` or `.usdz`) with materials that read the exported maps, and a Blender bridge that builds the materials. |
 
 <p>
 <img src="docs/images/barrel.png" width="49%" alt="stylized barrel with three texture sets">
@@ -115,13 +115,19 @@ CI builds and tests both platforms and publishes the binaries with `SHA256SUMS.t
 ## Build
 
 You need CMake ≥ 3.20 and a C++20 compiler: Xcode clang on macOS, or MSVC 2022 on Windows. There is no
-package manager; all dependencies are vendored single headers (cgltf, stb, sokol, Dear ImGui).
+package manager; dependencies are vendored single headers (cgltf, stb, sokol, Dear ImGui) and one git submodule,
+[LightUSD](https://github.com/StrangeApeGames/LightUSD) (the library that was tinyusdz), which writes the USD export.
 
 ```bash
+git submodule update --init  # third_party/LightUSD (or clone with --recursive)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build          # ~5 s clean build on 18 cores
+cmake --build build          # ~5 s clean build on 18 cores, after LightUSD has been built once
 bash tests/run_tests.sh      # end-to-end suite (~3 s)
 ```
+
+The first build also compiles the 70 LightUSD files that export needs. That took 65 s with `-j 8` on a 16-core
+desktop, and happens once: they are not rebuilt when Patina's own code changes. Without the submodule, or with
+`-DPATINA_USD=OFF`, Patina builds without USD export and `export --usd` says so.
 
 On Windows, run these from a "x64 Native Tools Command Prompt for VS 2022" (or a Developer PowerShell
 with `-arch=x64`) so `cl` is on the path, and run the tests from Git Bash. The binary is `build\patina.exe`.
@@ -153,7 +159,7 @@ you can rebuild while Claude Code has the dev server open.
 | `render` | render a preview (returns an image) |
 | `variants` | compare alternatives side by side |
 | `bake` | bake mesh maps |
-| `export` | write textures |
+| `export` | write textures, and optionally a textured `.glb` or the mesh as USD |
 | `library` | list materials, fields and presets, or read the guide with `topic="guide"` |
 | `validate` | check a project |
 | `batch` | run many commands at once |
@@ -172,6 +178,7 @@ patina edit work/crate.patina.json '[{"op":"add","layer":{"id":"dust","type":"sm
 patina render work/crate.patina.json --views iso,front --mode lit      # -> work/renders/crate.png
 patina render work/crate.patina.json --mode mask:dust                   # where does the dust go?
 patina export work/crate.patina.json --preset unreal --glb
+patina export work/crate.patina.json --preset gltf --usd usdz           # mesh + materials as USD (usda | usdc | usdz)
 patina batch --do export a.patina.json b.patina.json c.patina.json -j 8
 patina blender apply --project work/crate.patina.json --out crate.blend --render crate.png
 patina view work/crate.patina.json                                      # native viewer
@@ -222,6 +229,8 @@ patina guide                                                            # the ag
 | `src/library.cpp` | smart materials (parameterized templates) and export presets |
 | `src/render.*` | tiled CPU PBR rasterizer and contact sheets |
 | `src/export.*` | channel packing, manifest, textured GLB |
+| `src/usd.*` | USD export (`.usda`, `.usdc`, `.usdz`): meshes and UsdPreviewSurface materials, written and read back through LightUSD |
+| `third_party/LightUSD` | submodule: our fork of LightUSD, on the branch and commit the engine's cooker uses |
 | `src/commands.*` | command implementations shared by the CLI and MCP; session caches |
 | `src/mcp.cpp` | MCP server (stdio JSON-RPC, concurrent tool calls) |
 | `src/update.cpp` | `install` / `update`: installed binary, Claude Code skill, MCP registration, verified self-update |

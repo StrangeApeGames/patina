@@ -30,6 +30,7 @@ Workflow:
 4. render(project) - LOOK at the result (returns an image). mode="mask:<layer_id>" shows where a layer applies; mode="clay" shows height detail.
    variants(project, variants=[{label, ops}]) compares alternatives side by side in one call.
 5. export(project, preset="blender"|"gltf"|"unreal"|"unity_hdrp"|"unity_urp"|"godot", glb=true) - writes PNGs + manifest.json.
+   usd=true also writes the mesh as USD with materials that read those PNGs (usd="usdz": one file with the textures inside).
    blender(action="apply", project=...) builds Principled BSDF materials in a .blend and can render it.
 Coordinates: points are normalized bounding-box coords [x,y,z] in 0..1 (0 = min corner). +Y is up, +Z is front, +X is right.
 Lengths (radius/size) are fractions of the object's largest dimension. Noise "scale" = features per object size.
@@ -82,8 +83,10 @@ static const ToolDef kTools[] = {
         "views":{},"mode":{"type":"string"},"size":{"type":"integer"},"resolution":{"type":"integer"}},"required":["project","variants"]})~"},
     {"bake", "bake", "Bake (or re-bake with force=true) mesh maps: AO, curvature, thickness, normals. preview=true returns an image of them. Other commands bake automatically. Runs on the GPU when there is one (stats.device); verify=true bakes on GPU and CPU and reports how far apart the maps are.",
      R"~({"type":"object","properties":{"project":{"type":"string"},"force":{"type":"boolean"},"preview":{"type":"boolean"},"verify":{"type":"boolean"},"resolution":{"type":"integer"}},"required":["project"]})~"},
-    {"export", "export", "Export final textures + manifest.json. preset: blender (default) | gltf | unreal | unity_hdrp | unity_urp | godot | maps. glb=true also writes a textured .glb.",
+    {"export", "export", "Export final textures + manifest.json. preset: blender (default) | gltf | unreal | unity_hdrp | unity_urp | godot | maps. glb=true also writes a textured .glb. "
+     "usd=true also writes the mesh as USD (.usda) with UsdPreviewSurface materials that read the exported textures; usd=\"usdc\" writes binary, usd=\"usdz\" one file with the textures inside.",
      R"~({"type":"object","properties":{"project":{"type":"string"},"preset":{"type":"string"},"out":{"type":"string"},"glb":{"type":"boolean"},
+        "usd":{"description":"true (= \"usda\", text) | \"usda\" | \"usdc\" (binary) | \"usdz\" (one file with the textures inside)"},
         "resolution":{"type":"integer"}},"required":["project"]})~"},
     {"library", "library", "List smart materials (with params), field/generator types (with params), channels, blend modes, export presets, render modes. topic narrows it: guide (full agent guide with recipes - read this first) | smart_materials | fields | channels | blend_modes | export_presets | render | modifiers.",
      R"~({"type":"object","properties":{"topic":{"type":"string"},"project":{"type":"string","description":"include the project's library/ folder"}}})~"},

@@ -267,7 +267,7 @@ static std::string skill_markdown(const std::string& exe) {
   md += "description: Texture 3D models with Patina, a headless Substance-Painter-style PBR texturing engine (layer stacks, "
         "smart materials, edge wear/dirt/rust masks, paint strokes, decals, previews). Use when asked to texture, paint, "
         "weather or age a 3D asset (.glb/.gltf/.obj or a Blender object), or to make PBR texture maps for Blender, Unreal, "
-        "Unity, Godot or glTF.\n";
+        "Unity, Godot, glTF or USD.\n";
   md += "---\n\n";
   md += strf("# Patina %s\n\n", PATINA_VERSION);
   md += "Use the `patina` MCP tools when they are available. Otherwise run the CLI, which has the same commands and prints JSON "

@@ -32,7 +32,7 @@ Layers are listed **bottom to top**: later layers paint over earlier ones.
    - Get close-ups with `views=[{"azimuth":30,"elevation":10,"zoom":3,"target":[0.5,0.9,0.5]}]` and a higher `resolution` (e.g. 2048): fine grain, rust and edge wear only read up close.
    - Lighting is a studio HDRI (`environment="studio"`). Turn it with `env_rotation` to move reflections across metal, or pass a path to your own equirectangular `.hdr`.
 5. `variants(project, variants=[...])`: when unsure, render 2–6 alternatives in one call, then apply the best with `edit`.
-6. `export(project, preset, glb=true)`: writes PNGs plus `manifest.json` (and a textured `.glb`).
+6. `export(project, preset, glb=true)`: writes PNGs plus `manifest.json` (and a textured `.glb`). `usd=true` also writes the mesh as USD (see §10).
 7. `blender(action="apply", project=..., out="x.blend", render="x.png")`: builds Principled BSDF materials.
 
 ## 3. Coordinates and units
@@ -267,6 +267,30 @@ the surface, `[-0.5, 1]` leaves gaps.
 
 - `manifest.json` lists every file per texture set. `blender(action="apply")` reads it.
 - The normal map already contains the height detail.
+
+### USD
+
+`export(project, preset, usd=true)` (CLI `--usd`) also writes the mesh as USD next to the textures, for Blender, Maya,
+Houdini, usdview or an engine's USD importer.
+
+| `usd`              | File          | Use it for |
+|--------------------|---------------|------------|
+| `true` or `"usda"` | `<name>.usda` | Text you can read and diff. Reads the PNGs beside it. |
+| `"usdc"`           | `<name>.usdc` | The same in binary, and much smaller: a quarter of the size for a 40k-triangle mesh. |
+| `"usdz"`           | `<name>.usdz` | One file with the textures inside, to send or to view on its own. |
+
+- **Mesh:** one `Mesh` per part under a root named after the project, +Y up, in meters, with normals and UVs (`st`). A
+  part with several texture sets gets one `GeomSubset` per set.
+- **Materials:** one `UsdPreviewSurface` material per texture set, in `<root>/Materials`, named after the set. Each one
+  reads the maps the preset wrote, whatever their packing (base color, roughness, metallic, occlusion and normal,
+  plus opacity and emissive when the set uses them).
+- **Names:** USD names allow only letters, digits and `_`, so `Cube.001` becomes `Cube_001`. The original is kept as
+  the prim's `displayName`.
+- **Pick the preset for where the USD is going.** `gltf`, `godot` and `blender` store OpenGL normals and roughness,
+  which is what USD expects, so they import everywhere. `unreal` (DirectX normals) and `unity_*` (smoothness) are
+  read through a remap on the texture that some importers skip. The result's `usd.warnings` says so when it applies.
+- The result's `usd` block has the path and what the file holds (`meshes`, `triangles`, `materials`, `textures`).
+  Export reads every USD file back before it reports success, so those counts are what is in the file.
 
 ## 11. Custom smart materials
 

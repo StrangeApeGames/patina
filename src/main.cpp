@@ -31,6 +31,7 @@ usage: patina <command> [args] [--flags]      (all commands print JSON)
   render   <project> [-o out.png] [--views iso,front] [--mode lit] [--size 512] [--sheet]
   variants <project> <variants.json>           render alternatives side by side
   export   <project> [--preset blender|gltf|unreal|unity_hdrp|unity_urp|godot|maps] [-o dir] [--glb]
+           [--usd [usda|usdc|usdz]]            also write the mesh as USD, with materials that read the textures
   library  [--topic smart_materials|fields|channels|blend_modes|export_presets|render|modifiers]
   batch    <jobs.json> [-j 8]                  run many commands concurrently
   batch    --do render|export <p1> <p2> ...     same command on many projects
@@ -96,7 +97,10 @@ int main(int argc, char** argv) {
       if (key == "j") key = "parallel";
       if (key == "res") key = "resolution";
       if (key == "compact") { compact = true; continue; }
-      if (i + 1 < argc && !(argv[i + 1][0] == '-' && argv[i + 1][1] == '-')) args.set(key, parse_value(argv[++i]));
+      // the next argument is this flag's value unless it is a flag itself (`--glb -o dir`); "-", "-1" and "-.5" are values
+      const char* next = i + 1 < argc ? argv[i + 1] : nullptr;
+      bool next_is_flag = next && next[0] == '-' && next[1] != '\0' && next[1] != '.' && !std::isdigit((unsigned char)next[1]);
+      if (next && !next_is_flag) args.set(key, parse_value(argv[++i]));
       else args.set(key, true);
     } else {
       pos.push_back(a);

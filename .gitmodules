@@ -1,0 +1,5 @@
+[submodule "third_party/LightUSD"]
+	path = third_party/LightUSD
+	url = https://github.com/StrangeApeGames/LightUSD.git
+	branch = canopy
+	shallow = true
