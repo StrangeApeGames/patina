@@ -39,9 +39,10 @@ class Gpu {
   virtual BufferRef upload(const void* data, size_t count, uint32_t stride) = 0;
   // Runs `kernel` over n elements and blocks until the result is back. `scene[k]` binds to slot k (null entries
   // are skipped), `in` (n * in_stride bytes) to slot 8 and `constants` to the constant buffer; n * out_stride
-  // bytes are written to `out`. Safe to call from many threads (calls are serialized). Throws GpuError.
-  virtual void run(GpuKernel kernel, const void* constants, uint32_t constants_size, const BufferRef* scene, int scene_count,
-                   const void* in, uint32_t in_stride, size_t n, void* out, uint32_t out_stride) = 0;
+  // bytes are written to `out`. Safe to call from many threads (calls are serialized). Returns the milliseconds
+  // the device took, without the wait for other callers. Throws GpuError.
+  virtual double run(GpuKernel kernel, const void* constants, uint32_t constants_size, const BufferRef* scene, int scene_count,
+                     const void* in, uint32_t in_stride, size_t n, void* out, uint32_t out_stride) = 0;
   // Frees the input and output buffers run() keeps between calls. The baker calls it after a bake, so an idle
   // MCP server holds no video memory.
   virtual void trim() = 0;

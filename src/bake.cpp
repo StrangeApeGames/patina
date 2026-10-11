@@ -4,6 +4,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <mutex>
@@ -112,7 +113,7 @@ static void raster_set(const Mesh& m, int set, int res, SampleSet& ss) {
         // gutter outside any of the three lines cannot be a gutter sample of this triangle
         auto to_texels = [&](vec2 p, vec2 q) { return std::fabs(area) / std::sqrt((q.x - p.x) * (q.x - p.x) + (q.y - p.y) * (q.y - p.y)); };
         float k0 = to_texels(b, c), k1 = to_texels(c, a), k2 = to_texels(a, b);
-        const float kFar = -kGutter * 1.001f;
+        const float kFar = -(kGutter + 0.25f);  // the margin covers float error on long thin triangles
         int x0 = std::max(px0, (int)std::floor(std::fmin(a.x, std::fmin(b.x, c.x)) - kGutter));
         int x1 = std::min(std::min(px0 + kTile, res) - 1, (int)std::floor(std::fmax(a.x, std::fmax(b.x, c.x)) + kGutter));
         int y0 = std::max(py0, (int)std::floor(std::fmin(a.y, std::fmin(b.y, c.y)) - kGutter));
@@ -467,7 +468,7 @@ static void bake_ao_thickness(const Mesh& m, const BVH& bvh, SampleSet& ss, cons
     p.maxd = ao_maxd;
     p.thickness_samples = (uint32_t)th_n;
     p.thickness_maxd = th_maxd;
-    gpu_run(*gpu, GpuKernel::Surface, p, scene, ids.size(), sizeof(GpuSample), sizeof(GpuSurfaceOut),
+    gpu_run(*gpu, GpuKernel::Surface, p, scene, ids.size(), sizeof(GpuSample), sizeof(GpuSurfaceOut), (uint64_t)ao_n + th_n,
             [&](size_t first, size_t count, void* dst) {
               GpuSample* r = (GpuSample*)dst;
               parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
@@ -763,7 +764,7 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
   if (!force && !cache_dir.empty())
     for (bool d : {true, false}) {
       std::string f = cache_path(cache_dir, device_key(d));
-      if ((d && !want_gpu) || !file_exists(f)) continue;
+      if ((d && !want_gpu) || (!d && device == BakeDevice::Gpu) || !file_exists(f)) continue;
       cached_file = f;
       on_gpu = d;
       break;
@@ -813,6 +814,10 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
     bake_geometry();
     if (want_gpu) gpu = Gpu::get();
     if (device == BakeDevice::Gpu && !gpu) fail("no GPU to bake on: %s", Gpu::unavailable_reason().c_str());
+    struct Scratch {  // however this bake ends, the device keeps none of its buffers
+      Gpu* gpu;
+      ~Scratch() { if (gpu) gpu->trim(); }
+    } scratch{gpu};
     try {
       bake_traced(gpu);
     } catch (const GpuError& e) {
@@ -823,9 +828,13 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
       bake_geometry();  // the normal bake had started adding to the curvature
       bake_traced(nullptr);
     }
-    if (gpu) gpu->trim();
     on_gpu = gpu != nullptr;
-    if (!cache_dir.empty()) CacheWriter::get().push(cache_path(cache_dir, device_key(on_gpu)), bk);
+    if (!cache_dir.empty()) {
+      // a fresh bake replaces what either device cached before (--force after an input the key does not cover changed)
+      std::error_code ec;
+      std::filesystem::remove(cache_path(cache_dir, device_key(!on_gpu)), ec);
+      CacheWriter::get().push(cache_path(cache_dir, device_key(on_gpu)), bk);
+    }
   }
   bk->key = device_key(on_gpu);
   stats.set("device", on_gpu ? "gpu" : "cpu");  // which device traced the maps (also when they came from the cache)

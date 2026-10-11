@@ -41,11 +41,13 @@ struct Com {
   T** out() { reset(); return &p; }
 };
 
+// Destroyed in reverse order at exit: g_device first, which waits for a warm-up still running, and that task
+// ends by locking g_m and writing g_reason.
 std::mutex g_m;                    // guards the state below
-std::shared_future<Gpu*> g_device;  // the device is intentionally leaked: it lives for the process
-bool g_started = false;
 std::string g_reason;
 std::atomic<bool> g_failed{false};
+bool g_started = false;
+std::shared_future<Gpu*> g_device;  // the device is intentionally leaked: it lives for the process
 
 // PATINA_GPU, lowercased; "" = pick the best hardware adapter
 std::string wanted() {
@@ -98,17 +100,50 @@ class D3D11Gpu : public Gpu {
     return b;
   }
 
-  void run(GpuKernel kernel, const void* constants, uint32_t constants_size, const BufferRef* scene, int scene_count, const void* in,
-           uint32_t in_stride, size_t n, void* out, uint32_t out_stride) override {
-    if (n == 0) return;
+  double run(GpuKernel kernel, const void* constants, uint32_t constants_size, const BufferRef* scene, int scene_count, const void* in,
+             uint32_t in_stride, size_t n, void* out, uint32_t out_stride) override {
+    if (n == 0) return 0;
+    double ms = dispatch(kernel, constants, constants_size, scene, scene_count, in, in_stride, n, out, out_stride);
+    rest(ms * kRestShare);
+    return ms;
+  }
+
+  void trim() override {
+    std::lock_guard<std::mutex> lk(m_);
+    io_.clear();
+    ctx->ClearState();
+    ctx->Flush();  // Direct3D frees released buffers on the next flush
+  }
+
+ private:
+  // A bake must not own the GPU: after every dispatch it is left idle for this share of the dispatch's time, so
+  // the desktop and other applications get their turn (the baker keeps dispatches to a few milliseconds).
+  static constexpr double kRestShare = 0.1;
+
+  // Sleep() can oversleep by 15 ms; a high-resolution waitable timer (Windows 10 1803+) does not. Without
+  // one there is no pause.
+  static void rest(double ms) {
+    if (ms < 0.2) return;
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    if (!timer) return;
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)(std::min(ms, 5.0) * 10000.0);  // relative, in 100 ns
+    if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 100);
+    CloseHandle(timer);
+  }
+
+  double dispatch(GpuKernel kernel, const void* constants, uint32_t constants_size, const BufferRef* scene, int scene_count, const void* in,
+                  uint32_t in_stride, size_t n, void* out, uint32_t out_stride) {
     std::lock_guard<std::mutex> lk(m_);
     if (g_failed) throw GpuError("the GPU device failed earlier");
+    Timer timer;
     Com<ID3D11ComputeShader>& cs = shaders_[(int)kernel];
     if (!cs.p) check(dev->CreateComputeShader(kKernels[(int)kernel].data, kKernels[(int)kernel].size, nullptr, cs.out()), "a compute shader");
 
     Io& io = io_[((uint64_t)in_stride << 32) | out_stride];
     if (io.cap < n) {
       size_t cap = std::max<size_t>(n, 4096);
+      io.cap = 0;  // if a buffer below cannot be created, the next run starts over instead of using half a set
       D3D11_BUFFER_DESC d = {};
       d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
       d.ByteWidth = (UINT)(cap * in_stride);
@@ -168,16 +203,9 @@ class D3D11Gpu : public Gpu {
     memcpy(out, map.pData, n * out_stride);
     ctx->Unmap(io.staging.p, 0);
     check(dev->GetDeviceRemovedReason(), "the dispatch");
+    return timer.ms();
   }
 
-  void trim() override {
-    std::lock_guard<std::mutex> lk(m_);
-    io_.clear();
-    ctx->ClearState();
-    ctx->Flush();  // Direct3D frees released buffers on the next flush
-  }
-
- private:
   struct Io {  // per (input stride, output stride): reused across dispatches, grown on demand
     Com<ID3D11Buffer> in, out, staging;
     Com<ID3D11ShaderResourceView> in_srv;
@@ -263,13 +291,20 @@ void Gpu::warm_up() {
   std::lock_guard<std::mutex> lk(g_m);
   if (g_started) return;
   g_started = true;
-  g_device = std::async(std::launch::async, [] {
-    std::string reason;
-    Gpu* g = create(reason);
-    std::lock_guard<std::mutex> lk2(g_m);
-    g_reason = reason;
-    return g;
-  }).share();
+  try {
+    g_device = std::async(std::launch::async, [] {
+      std::string reason;
+      Gpu* g = create(reason);
+      std::lock_guard<std::mutex> lk2(g_m);
+      g_reason = reason;
+      return g;
+    }).share();
+  } catch (const std::exception&) {  // no thread to start it on: no GPU for this process
+    std::promise<Gpu*> none;
+    none.set_value(nullptr);
+    g_device = none.get_future().share();
+    g_reason = "cannot start a thread for the GPU device";
+  }
 }
 
 Gpu* Gpu::get() {

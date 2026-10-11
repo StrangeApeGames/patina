@@ -36,13 +36,17 @@ void GpuScene::bind(Gpu::BufferRef out[Gpu::kSceneSlots]) const {
 }
 
 void gpu_run(Gpu& gpu, GpuKernel kernel, GpuParams params, const GpuScene& scene, size_t n, uint32_t in_stride, uint32_t out_stride,
-             const std::function<void(size_t, size_t, void*)>& fill, const std::function<void(size_t, size_t, const void*)>& store) {
+             uint64_t rays, const std::function<void(size_t, size_t, void*)>& fill,
+             const std::function<void(size_t, size_t, const void*)>& store) {
   if (n == 0) return;
   Gpu::BufferRef bufs[Gpu::kSceneSlots];
   scene.bind(bufs);
-  constexpr double kTargetMs = 60.0;
-  const size_t kMax = std::min<size_t>(size_t(1) << 20, (size_t(64) << 20) / std::max(in_stride, out_stride));
-  size_t chunk = 4096;
+  constexpr double kTargetMs = 8.0;  // short enough for the desktop to draw its frames in between
+  constexpr uint64_t kMaxRays = 32u << 20;  // per dispatch: well under a second even on an integrated GPU
+  const size_t kMax = std::min({size_t(1) << 20, (size_t(64) << 20) / std::max(in_stride, out_stride),
+                                (size_t)std::max<uint64_t>(kMaxRays / std::max<uint64_t>(rays, 1), 16)});
+  const size_t kMin = std::min<size_t>(1024, kMax);
+  size_t chunk = std::min<size_t>(4096, kMax);
   std::vector<uint8_t> in, out;
   for (size_t first = 0; first < n;) {
     size_t count = std::min(chunk, n - first);
@@ -50,14 +54,12 @@ void gpu_run(Gpu& gpu, GpuKernel kernel, GpuParams params, const GpuScene& scene
     out.resize(count * out_stride);
     fill(first, count, in.data());
     params.count = (uint32_t)count;
-    Timer t;
-    gpu.run(kernel, &params, sizeof params, bufs, Gpu::kSceneSlots, in.data(), in_stride, count, out.data(), out_stride);
-    double ms = t.ms();
+    double ms = gpu.run(kernel, &params, sizeof params, bufs, Gpu::kSceneSlots, in.data(), in_stride, count, out.data(), out_stride);
     store(first, count, out.data());
     // the first dispatch also pays for the driver compiling the kernel, so it may only grow the chunk
     double f = std::clamp(kTargetMs / std::max(ms, 0.01), first == 0 ? 1.0 : 0.25, 4.0);
     first += count;
-    chunk = std::clamp<size_t>((size_t)(count * f), 1024, kMax);
+    chunk = std::clamp<size_t>((size_t)(count * f), kMin, kMax);
   }
 }
 

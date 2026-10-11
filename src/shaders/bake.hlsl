@@ -370,6 +370,14 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
 
 #ifdef KERNEL_PROJECT
+// Is o inside a solid? Looking away from the low surface, the first thing seen is then the inside of a wall.
+bool inside(Bvh g, float3 o, float3 d) {
+  float t, u, v;
+  uint ref;
+  if (!intersect(g, o, d, 0.0, 1e30, ANY, t, ref, u, v)) return false;
+  return dot(tri_normal(g_tris[ref]), d) > 0.0;
+}
+
 // High -> low: every supersample casts a ray from the cage through the low surface and takes the first
 // high-poly hit (see the header of bake_normal.cpp for cage, skew and bake groups).
 struct ProjIn {  // GpuProjIn
@@ -413,9 +421,10 @@ void main(uint3 id : SV_DispatchThreadID) {
       uint ref;
       bool cull = (g_flags & F_BACKFACES) != 0, found = false, more = true;
       [loop] for (int k = 0; k < 8 && more && !found; k++) {
-        // the first high-poly surface facing the cage, unless a backface lies on it (two solid parts touch there)
+        // the first high-poly surface facing the cage, unless a backface lies on it and the ray started inside a
+        // solid (two parts touch there)
         if (!intersect(g, o, -s.dir, tmin, tmax, cull ? FRONT : ANY, th, ref, u, v)) more = false;
-        else if (cull && occluded(g, o, -s.dir, th - g_eps, th + g_eps, BACK)) tmin = th + g_eps;
+        else if (cull && occluded(g, o, -s.dir, th - g_eps, th + g_eps, BACK) && inside(g, o, s.dir)) tmin = th + g_eps;
         else found = true;
       }
       if (found) {
