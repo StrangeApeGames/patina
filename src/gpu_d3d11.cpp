@@ -229,6 +229,7 @@ Gpu* create(std::string& reason) {
       if (factory->EnumAdapters1(i, a.out()) == DXGI_ERROR_NOT_FOUND) break;
       DXGI_ADAPTER_DESC1 d = {};
       if (!a.p || FAILED(a->GetDesc1(&d)) || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+      if (d.VendorId == 0x1414 && d.DeviceId == 0x8c) continue;  // Microsoft Basic Render Driver: WARP, not always flagged as software (VMs)
       std::string nm = narrow(d.Description);
       if (!want.empty() && to_lower(nm).find(want) == std::string::npos) continue;
       if (!best.p || d.DedicatedVideoMemory > best_mem) {
