@@ -12,11 +12,13 @@
 // the point along the normal and both tangents, multiple importance sampling between the three
 // projections and a cubic falloff. Only runs near feature edges; stays within the same part by default.
 //
+// The rays are traced on the GPU when there is one (shaders/bake.hlsl mirrors the estimators here), otherwise
+// on all cores.
+//
 // Results are denoised with an edge-avoiding a-trous filter in UV space (guided by 3D position and
 // normal, so nothing blurs across seams or islands), encoded in the low's MikkTSpace basis, and turned
 // into extra curvature so edge wear follows baked edges.
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +27,7 @@
 #include <unordered_map>
 
 #include "bake.h"
+#include "bake_gpu.h"
 #include "eval.h"
 
 namespace pt {
@@ -146,10 +149,10 @@ struct SubBVH {
     for (uint32_t t : tris) for (int k = 0; k < 3; k++) idx.push_back(m.idx[t * 3 + k]);
     if (!idx.empty()) bvh.build(m.pos, idx);
   }
-  bool hit(vec3 o, vec3 d, float tmin, float tmax, float& t, uint32_t& orig, float& u, float& v) const {
+  bool hit(vec3 o, vec3 d, float tmin, float tmax, float& t, uint32_t& orig, float& u, float& v, BVH::Facing facing = BVH::kAny) const {
     if (bvh.empty()) return false;
     uint32_t local;
-    if (!bvh.intersect(o, d, tmin, tmax, t, local, u, v)) return false;
+    if (!bvh.intersect(o, d, tmin, tmax, t, local, u, v, facing)) return false;
     orig = tri[local];
     return true;
   }
@@ -217,6 +220,31 @@ void feature_edges(const Mesh& m, const std::vector<uint32_t>& weld, float min_a
       if (split || crease) { out.a.push_back(m.pos[va]); out.b.push_back(m.pos[vb]); }
     }
   }
+}
+
+// An EdgeGrid on the GPU: its cells as an open-addressing hash table over the two halves of EdgeGrid::key
+// (the kernel's edge_distance probes it the same way), the segment lists end to end, and the segments.
+void upload_edges(Gpu& gpu, const EdgeGrid& g, GpuScene& scene, GpuParams& p) {
+  size_t cap = 1;
+  while (cap < g.cells.size() * 2) cap <<= 1;
+  std::vector<GpuEdgeCell> table(cap, GpuEdgeCell{0, 0, 0, 0});
+  std::vector<uint32_t> list;
+  for (auto& kv : g.cells) {
+    if (kv.second.empty()) continue;
+    uint32_t lo = (uint32_t)kv.first, hi = (uint32_t)(kv.first >> 32);
+    size_t slot = hash_u32(lo ^ hash_u32(hi)) & (cap - 1);
+    while (table[slot].count) slot = (slot + 1) & (cap - 1);
+    table[slot] = {lo, hi, (uint32_t)list.size(), (uint32_t)kv.second.size()};
+    list.insert(list.end(), kv.second.begin(), kv.second.end());
+  }
+  std::vector<GpuSeg> segs(g.a.size());
+  for (size_t k = 0; k < segs.size(); k++) segs[k] = {g.a[k], 0.f, g.b[k], 0.f};
+  scene.edge_cells = gpu.upload(table.data(), table.size(), sizeof(GpuEdgeCell));
+  scene.edge_list = gpu.upload(list.data(), list.size(), sizeof(uint32_t));
+  scene.edge_segs = gpu.upload(segs.data(), segs.size(), sizeof(GpuSeg));
+  p.edge_cell = g.cell;
+  p.edge_radius = g.radius;
+  p.edge_mask = (uint32_t)(cap - 1);
 }
 
 inline vec2 hammersley2(uint32_t i, uint32_t n, uint32_t scramble) {
@@ -295,7 +323,9 @@ void denoise_vectors(const SampleSet& ss, std::vector<vec3>& v, const std::vecto
             if (s < 0) continue;
             float w = k[dx + 2] * k[dy + 2];
             w *= std::exp(-length2(ss.pos[s] - ss.pos[i]) / sp2);           // same place in 3D
-            w *= std::pow(std::fmax(0.f, dot(ss.fnrm[s], ss.fnrm[i])), 32.f);  // same face orientation
+            float c = std::fmax(0.f, dot(ss.fnrm[s], ss.fnrm[i]));
+            c *= c; c *= c; c *= c; c *= c; c *= c;  // ^32: same face orientation
+            w *= c;
             acc += cur[s] * w;
             wsum += w;
           }
@@ -309,7 +339,7 @@ void denoise_vectors(const SampleSet& ss, std::vector<vec3>& v, const std::vecto
 
 }  // namespace
 
-void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& stats) {
+void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& stats, Gpu* gpu) {
   const Mesh& low = *bk.mesh;
   std::vector<SampleSet>& sets = bk.sets;
   const NormalBakeSettings& s = bs.normal;
@@ -445,6 +475,30 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
   }
 
   int grid = std::max(1, (int)std::lround(std::sqrt((float)s.samples)));
+
+  // On the GPU: every BVH above in one scene (bake groups first, so a group's index is its BVH index), the
+  // traced mesh's normals, and the feature edges the projection kernel rounds against.
+  GpuScene scene;
+  std::vector<uint32_t> bevel_bvh;  // part of the bevelled mesh -> scene BVH
+  uint32_t whole_gpu = 0, high_all_gpu = 0;
+  GpuParams edge_params;
+  if (gpu) {
+    for (auto& g : groups) scene.add(g.bvh, &g.tri);
+    for (auto& b : part_bvh) bevel_bvh.push_back(scene.add(b.bvh, &b.tri));
+    if (R > 0 && !s.bevel_same_part) whole_gpu = scene.add(whole_bvh.bvh, &whole_bvh.tri);
+    if (ao_high) high_all_gpu = scene.add(high_all.bvh, &high_all.tri);
+    scene.upload(*gpu);
+    std::vector<GpuTriAttr> attr(bev_mesh.tri_count());
+    parallel_for((int64_t)attr.size(), [&](int64_t b, int64_t e) {
+      for (int64_t t = b; t < e; t++) {
+        uint32_t bb = R > 0 ? (s.bevel_same_part ? bevel_bvh[bev_mesh.tri_part[t]] : whole_gpu) : 0;
+        attr[t] = {bev_mesh.nrm[bev_mesh.idx[t * 3]], bb, bev_mesh.nrm[bev_mesh.idx[t * 3 + 1]], 0, bev_mesh.nrm[bev_mesh.idx[t * 3 + 2]], 0};
+      }
+    });
+    scene.attr = gpu->upload(attr.data(), attr.size(), sizeof(GpuTriAttr));
+    if (R > 0 && high) upload_edges(*gpu, feat_high, scene, edge_params);
+  }
+
   int64_t misses_total = 0, samples_total = 0;
   Json sets_j = Json::object();
   for (auto& ss : sets) {
@@ -453,83 +507,184 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     ss.nmiss.assign(n, 0);
     std::vector<uint8_t> denoise_mask(n, 0);
     std::vector<vec3> world(n);
-    std::atomic<int64_t> misses{0};
     std::vector<float> cage_k, skew_k;  // painted cage / skew (mask stacks evaluated on this set's samples)
     if (high && !s.cage_mask.is_null()) cage_k = evaluate_mask(s.cage_mask, bk, ss.set, s.base_dir, &warnings);
     if (high && !s.skew_mask.is_null()) skew_k = evaluate_mask(s.skew_mask, bk, ss.set, s.base_dir, &warnings);
     std::vector<vec3> hit_p, hit_n;  // centre hit on the high poly (for AO)
     std::vector<uint8_t> hit_ok;
     if (ao_high) { hit_p.assign(n, vec3(0.f)); hit_n.assign(n, vec3(0.f)); hit_ok.assign(n, 0); }
-    parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
-      for (int64_t i = b; i < e; i++) {
+    auto sample_seed = [&](size_t i) { return hash_u32((uint32_t)ss.texel[i] * 2654435761u + (uint32_t)ss.set * 97u); };
+    if (high) {
+      // auto: at hard edges dir == nc on both sides, so starting along dir is gap-free and never shifts
+      // details sideways; a fixed skew starts on the continuous cage (Toolbag) so edges stay closed
+      bool start_on_dir = s.skew < 0 && skew_k.empty();
+      // One texel's rays (cage, skew and bake group resolved); the estimator below and the GPU kernel read it.
+      auto setup = [&](size_t i) {
         uint32_t t = ss.tri[i];
         vec3 bc = barycentric(low, t, ss.pos[i]);
-        vec3 ns = normalize(ss.nrm[i]);
-        vec3 nc = normalize(avg[weld[low.idx[t * 3]]] * bc.x + avg[weld[low.idx[t * 3 + 1]]] * bc.y + avg[weld[low.idx[t * 3 + 2]]] * bc.z);
-        vec3 tg = ss.tan[i].xyz(), bt = cross(ns, tg) * ss.tan[i].w;
-        uint32_t seed = hash_u32((uint32_t)ss.texel[i] * 2654435761u + (uint32_t)ss.set * 97u);
+        GpuProjIn in{};
+        in.pos = ss.pos[i];
+        in.seed = sample_seed(i);
+        in.ns = normalize(ss.nrm[i]);
+        in.nc = normalize(avg[weld[low.idx[t * 3]]] * bc.x + avg[weld[low.idx[t * 3 + 1]]] * bc.y + avg[weld[low.idx[t * 3 + 2]]] * bc.z);
+        in.tg = ss.tan[i].xyz();
+        in.bt = cross(in.ns, in.tg) * ss.tan[i].w;
+        in.len_u = ss.len_u[i];
+        in.len_v = ss.len_v[i];
+        float w = s.skew >= 0 ? s.skew : smoothstep(0.f, s.skew_distance * ext, hard.distance(ss.pos[i]));
+        if (!skew_k.empty()) w = lerp(w, s.skew_to, skew_k[i]);
+        in.dir = normalize(lerp(in.nc, in.ns, w));
+        in.cg = cage_k.empty() ? cage : lerp(cage, s.cage_to * ext, cage_k[i]);
+        if (cage_m) {  // explicit cage point for this sample
+          in.pc = cage_m->pos[cage_m->idx[t * 3]] * bc.x + cage_m->pos[cage_m->idx[t * 3 + 1]] * bc.y + cage_m->pos[cage_m->idx[t * 3 + 2]] * bc.z;
+          vec3 d = ss.pos[i] - in.pc;
+          if (length2(d) > 1e-16f) in.dir = -normalize(d);
+        }
+        in.group = (uint32_t)low_group[low.tri_part[t]];
+        return in;
+      };
+      // CPU estimator, mirrored by the project kernel in shaders/bake.hlsl
+      auto project = [&](const GpuProjIn& in) {
+        GpuProjOut r{};
+        const SubBVH& g = groups[in.group];
         vec3 acc{0, 0, 0};
         int miss = 0;
-        bool bevelled = false;
-        if (high) {
-          float w = s.skew >= 0 ? s.skew : smoothstep(0.f, s.skew_distance * ext, hard.distance(ss.pos[i]));
-          if (!skew_k.empty()) w = lerp(w, s.skew_to, skew_k[i]);
-          vec3 dir = normalize(lerp(nc, ns, w));
-          float cg = cage_k.empty() ? cage : lerp(cage, s.cage_to * ext, cage_k[i]);
-          vec3 pc{0, 0, 0};  // explicit cage point for this sample
-          if (cage_m) {
-            pc = cage_m->pos[cage_m->idx[t * 3]] * bc.x + cage_m->pos[cage_m->idx[t * 3 + 1]] * bc.y + cage_m->pos[cage_m->idx[t * 3 + 2]] * bc.z;
-            vec3 d = ss.pos[i] - pc;
-            if (length2(d) > 1e-16f) dir = -normalize(d);
-          }
-          const SubBVH& g = groups[low_group[low.tri_part[t]]];
-          for (int sy = 0; sy < grid; sy++)
-            for (int sx = 0; sx < grid; sx++) {
-              float ox = (sx + 0.5f) / grid - 0.5f, oy = (sy + 0.5f) / grid - 0.5f;
-              vec3 p = ss.pos[i] + tg * (ox * ss.len_u[i]) - bt * (oy * ss.len_v[i]);
-              // auto: at hard edges dir == nc on both sides, so starting along dir is gap-free and never shifts
-              // details sideways; a fixed skew starts on the continuous cage (Toolbag) so edges stay closed
-              vec3 o = s.skew < 0 && skew_k.empty() ? p + dir * cg : p + nc * cg;
-              float tmax = s.skew < 0 && skew_k.empty() ? cg + depth : (cg + depth) / std::fmax(dot(nc, dir), 0.25f);
-              if (cage_m) {  // rays go from the cage point through the low surface
-                o = pc + (p - ss.pos[i]);
-                tmax = length(ss.pos[i] - pc) + depth;
-              }
-              float tmin = 0.f, th, u, v;
-              uint32_t ht;
-              vec3 nh;
-              bool found = false;
-              for (int k = 0; k < 8; k++) {
-                if (!g.hit(o, -dir, tmin, tmax, th, ht, u, v)) break;
-                if (s.ignore_backfaces && dot(tri_normal(*high, ht), dir) < 0.f) { tmin = th + eps; continue; }
-                nh = smooth_normal(*high, ht, u, v);
-                if (ao_high && sx == grid / 2 && sy == grid / 2) {
-                  vec3 hg = tri_normal(*high, ht);
-                  hit_p[i] = o - dir * th;
-                  hit_n[i] = dot(hg, nh) < 0 ? -hg : hg;
-                  hit_ok[i] = 1;
-                }
-                if (R > 0) {
-                  vec3 nb = bevel_at(o - dir * th, ht, nh, seed + (uint32_t)(sy * grid + sx) * 7919u);
-                  bevelled = bevelled || dot(nb, nh) < 0.99999f;
-                  nh = nb;
-                }
-                found = true;
-                break;
-              }
-              if (!found) { miss++; nh = ns; }
-              acc += nh;
+        for (int sy = 0; sy < grid; sy++)
+          for (int sx = 0; sx < grid; sx++) {
+            float ox = (sx + 0.5f) / grid - 0.5f, oy = (sy + 0.5f) / grid - 0.5f;
+            vec3 p = in.pos + in.tg * (ox * in.len_u) - in.bt * (oy * in.len_v);
+            vec3 o = start_on_dir ? p + in.dir * in.cg : p + in.nc * in.cg;
+            float tmax = start_on_dir ? in.cg + depth : (in.cg + depth) / std::fmax(dot(in.nc, in.dir), 0.25f);
+            if (cage_m) {  // rays go from the cage point through the low surface
+              o = in.pc + (p - in.pos);
+              tmax = length(in.pos - in.pc) + depth;
             }
-        } else {
-          vec3 nb = bevel_at(ss.pos[i], t, ns, seed);
-          bevelled = feat_low.distance(ss.pos[i]) < R;  // denoise the whole band so it fades out smoothly
-          acc = nb;
-        }
-        if (miss * 2 > grid * grid) { ss.nmiss[i] = 1; misses++; }
-        world[i] = normalize(acc);
-        denoise_mask[i] = bevelled;
+            float tmin = 0.f, th, u, v;
+            uint32_t ht;
+            vec3 nh;
+            bool found = false;
+            for (int k = 0; k < 8 && !found; k++) {
+              // the first high-poly surface facing the cage ...
+              if (!g.hit(o, -in.dir, tmin, tmax, th, ht, u, v, s.ignore_backfaces ? BVH::kFront : BVH::kAny)) break;
+              // ... unless a backface lies on it: that is where two solid parts touch (a bolt resting on a plate)
+              // and the ray started inside one of them, so the cage is too tight here. Testing a window around
+              // the hit instead of comparing two distances keeps this independent of float rounding.
+              if (s.ignore_backfaces && g.bvh.occluded(o, -in.dir, th - eps, th + eps, BVH::kBack)) tmin = th + eps;
+              else found = true;
+            }
+            if (found) {
+              nh = smooth_normal(*high, ht, u, v);
+              if (ao_high && sx == grid / 2 && sy == grid / 2) {
+                vec3 hg = tri_normal(*high, ht);
+                r.hit_p = o - in.dir * th;
+                r.hit_n = dot(hg, nh) < 0 ? -hg : hg;
+                r.flags |= kGpuOutHit;
+              }
+              if (R > 0) {
+                vec3 nb = bevel_at(o - in.dir * th, ht, nh, in.seed + (uint32_t)(sy * grid + sx) * 7919u);
+                if (dot(nb, nh) < 0.99999f) r.flags |= kGpuOutBevel;
+                nh = nb;
+              }
+            } else {
+              miss++;
+              nh = in.ns;
+            }
+            acc += nh;
+          }
+        if (miss * 2 > grid * grid) r.flags |= kGpuOutMiss;
+        r.n = normalize(acc);
+        return r;
+      };
+      auto finish = [&](size_t i, const GpuProjOut& r) {
+        world[i] = r.n;
+        ss.nmiss[i] = (r.flags & kGpuOutMiss) != 0;
+        denoise_mask[i] = (r.flags & kGpuOutBevel) != 0;
+        if (ao_high) { hit_p[i] = r.hit_p; hit_n[i] = r.hit_n; hit_ok[i] = (r.flags & kGpuOutHit) != 0; }
+      };
+      if (gpu) {
+        GpuParams p = edge_params;
+        p.samples = (uint32_t)s.bevel_samples;
+        p.eps = eps;
+        p.grid = (uint32_t)grid;
+        p.depth = depth;
+        p.bevel_r = R;
+        p.flags = (start_on_dir ? kGpuAutoSkew : 0) | (cage_m ? kGpuCageMesh : 0) | (s.ignore_backfaces ? kGpuBackfaces : 0) | (ao_high ? kGpuAoHigh : 0);
+        // The bevel costs hundreds of rays where a hit is near a feature edge and nothing elsewhere. A first pass
+        // projects every texel and reports the ones near an edge; a second pass bevels only those, so the
+        // threads of a dispatch do similar amounts of work.
+        std::vector<uint32_t> edge_ids;
+        GpuParams first_pass = p;
+        if (R > 0) first_pass.flags |= kGpuBevelDetect;
+        gpu_run(*gpu, GpuKernel::Project, first_pass, scene, n, sizeof(GpuProjIn), sizeof(GpuProjOut),
+                [&](size_t first, size_t count, void* dst) {
+                  parallel_for((int64_t)count, 256, [&](int64_t b, int64_t e) {
+                    for (int64_t j = b; j < e; j++) ((GpuProjIn*)dst)[j] = setup(first + j);
+                  });
+                },
+                [&](size_t first, size_t count, const void* src) {
+                  const GpuProjOut* r = (const GpuProjOut*)src;
+                  parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
+                    for (int64_t j = b; j < e; j++) finish(first + j, r[j]);
+                  });
+                  for (size_t j = 0; j < count; j++) if (r[j].flags & kGpuOutNear) edge_ids.push_back((uint32_t)(first + j));
+                });
+        gpu_run(*gpu, GpuKernel::Project, p, scene, edge_ids.size(), sizeof(GpuProjIn), sizeof(GpuProjOut),
+                [&](size_t first, size_t count, void* dst) {
+                  parallel_for((int64_t)count, 256, [&](int64_t b, int64_t e) {
+                    for (int64_t j = b; j < e; j++) ((GpuProjIn*)dst)[j] = setup(edge_ids[first + j]);
+                  });
+                },
+                [&](size_t first, size_t count, const void* src) {
+                  parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
+                    for (int64_t j = b; j < e; j++) finish(edge_ids[first + j], ((const GpuProjOut*)src)[j]);
+                  });
+                });
+      } else {
+        parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
+          for (int64_t i = b; i < e; i++) finish((size_t)i, project(setup((size_t)i)));
+        });
       }
-    });
+    } else {
+      // bevel shader on the low poly: only samples within reach of a feature edge are rounded, and the whole
+      // band is denoised so it fades out smoothly
+      parallel_for((int64_t)n, 256, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; i++) {
+          world[i] = normalize(ss.nrm[i]);
+          denoise_mask[i] = feat_low.distance(ss.pos[i]) < R;
+        }
+      });
+      std::vector<uint32_t> edge_ids;
+      for (size_t i = 0; i < n; i++) if (denoise_mask[i]) edge_ids.push_back((uint32_t)i);
+      auto bevel_bvh_of = [&](uint32_t t) -> const SubBVH& { return s.bevel_same_part ? part_bvh[low.tri_part[t]] : whole_bvh; };
+      if (gpu) {
+        GpuParams p;
+        p.samples = (uint32_t)s.bevel_samples;
+        p.bevel_r = R;
+        gpu_run(*gpu, GpuKernel::Bevel, p, scene, edge_ids.size(), sizeof(GpuBevelIn), 4 * sizeof(float),
+                [&](size_t first, size_t count, void* dst) {
+                  parallel_for((int64_t)count, 1024, [&](int64_t b, int64_t e) {
+                    for (int64_t j = b; j < e; j++) {
+                      uint32_t i = edge_ids[first + j], t = ss.tri[i];
+                      uint32_t bb = s.bevel_same_part ? bevel_bvh[low.tri_part[t]] : whole_gpu;
+                      ((GpuBevelIn*)dst)[j] = {ss.pos[i], sample_seed(i), normalize(ss.nrm[i]), bb, tri_normal(low, t), 0.f};
+                    }
+                  });
+                },
+                [&](size_t first, size_t count, const void* src) {
+                  const float* v = (const float*)src;
+                  for (size_t j = 0; j < count; j++) world[edge_ids[first + j]] = normalize(vec3(v[j * 4], v[j * 4 + 1], v[j * 4 + 2]));
+                });
+      } else {
+        parallel_for((int64_t)edge_ids.size(), 16, [&](int64_t b, int64_t e) {
+          for (int64_t j = b; j < e; j++) {
+            uint32_t i = edge_ids[j], t = ss.tri[i];
+            world[i] = normalize(bevel_normal(low, bevel_bvh_of(t), ss.pos[i], tri_normal(low, t), normalize(ss.nrm[i]), R, s.bevel_samples, sample_seed(i)));
+          }
+        });
+      }
+    }
+    int64_t misses = 0;
+    for (uint8_t v : ss.nmiss) misses += v;
     if (s.denoise && R > 0) denoise_vectors(ss, world, denoise_mask);
     // encode in the low's tangent space: the exact inverse of a MikkTSpace shader, which uses the
     // unnormalized interpolated vT, vN and vB = sign * cross(vN, vT): n = normalize(x vT + y vB + z vN)
@@ -554,29 +709,53 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     if (ao_high) {
       float maxd = bs.ao_distance * ext, aeps = ext * 2e-5f;
       int N = bs.ao_samples;
-      parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
-        for (int64_t i = b; i < e; i++) {
-          if (!hit_ok[i]) continue;
-          vec3 hn = hit_n[i], o = hit_p[i] + hn * aeps, T, B;
-          onb(hn, T, B);
-          uint32_t scr = hash_u32((uint32_t)ss.texel[i] * 747796405u + 11u);
-          int hits = 0;
-          for (int k = 0; k < N; k++) {
-            vec2 xi = hammersley2((uint32_t)k, (uint32_t)N, scr);
-            float r = std::sqrt(xi.x), phi = 2.f * kPi * xi.y;
-            vec3 d = T * (r * std::cos(phi)) + B * (r * std::sin(phi)) + hn * std::sqrt(std::fmax(0.f, 1.f - xi.x));
-            if (high_all.bvh.occluded(o, d, 0.f, maxd)) hits++;
+      auto scramble = [&](size_t i) { return hash_u32((uint32_t)ss.texel[i] * 747796405u + 11u); };
+      if (gpu) {
+        std::vector<uint32_t> ids;
+        for (size_t i = 0; i < n; i++) if (hit_ok[i]) ids.push_back((uint32_t)i);
+        GpuParams p;
+        p.samples = (uint32_t)N;
+        p.maxd = maxd;
+        p.eps = aeps;
+        p.bvh = high_all_gpu;
+        gpu_run(*gpu, GpuKernel::AoHigh, p, scene, ids.size(), sizeof(GpuHit), sizeof(uint32_t),
+                [&](size_t first, size_t count, void* dst) {
+                  parallel_for((int64_t)count, 4096, [&](int64_t b, int64_t e) {
+                    for (int64_t j = b; j < e; j++) {
+                      uint32_t i = ids[first + j];
+                      ((GpuHit*)dst)[j] = {hit_p[i], scramble(i), hit_n[i], 0.f};
+                    }
+                  });
+                },
+                [&](size_t first, size_t count, const void* src) {
+                  for (size_t j = 0; j < count; j++) ss.ao[ids[first + j]] = 1.f - (float)((const uint32_t*)src)[j] / N;
+                });
+      } else {
+        // mirrored by the AO-from-high kernel in shaders/bake.hlsl
+        parallel_for((int64_t)n, 64, [&](int64_t b, int64_t e) {
+          for (int64_t i = b; i < e; i++) {
+            if (!hit_ok[i]) continue;
+            vec3 hn = hit_n[i], o = hit_p[i] + hn * aeps, T, B;
+            onb(hn, T, B);
+            uint32_t scr = scramble((size_t)i);
+            int hits = 0;
+            for (int k = 0; k < N; k++) {
+              vec2 xi = hammersley2((uint32_t)k, (uint32_t)N, scr);
+              float r = std::sqrt(xi.x), phi = 2.f * kPi * xi.y;
+              vec3 d = T * (r * std::cos(phi)) + B * (r * std::sin(phi)) + hn * std::sqrt(std::fmax(0.f, 1.f - xi.x));
+              if (high_all.bvh.occluded(o, d, 0.f, maxd)) hits++;
+            }
+            ss.ao[i] = 1.f - (float)hits / N;
           }
-          ss.ao[i] = 1.f - (float)hits / N;
-        }
-      });
+        });
+      }
       denoise_samples(ss, ss.ao);
     }
     Json sj = Json::object();
-    sj.set("misses", (int64_t)misses.load());
-    sj.set("miss_fraction", n ? (double)misses.load() / n : 0.0);
+    sj.set("misses", misses);
+    sj.set("miss_fraction", n ? (double)misses / n : 0.0);
     sets_j.set(ss.name, sj);
-    misses_total += misses.load();
+    misses_total += misses;
     samples_total += (int64_t)n;
   }
 
@@ -612,28 +791,42 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
       rad = std::min(rad, 32);
       std::vector<float> dimg((size_t)res * res), tmp((size_t)res * res);
       to_image(ss, div.data(), 1, dimg.data());
-      for (int pass = 0; pass < 2; pass++) {
-        parallel_for(res, 4, [&](int64_t y0, int64_t y1) {
-          for (int64_t y = y0; y < y1; y++)
-            for (int x = 0; x < res; x++) {
-              float a = 0;
-              for (int k = -rad; k <= rad; k++) {
-                int xx = pass == 0 ? std::clamp(x + k, 0, res - 1) : x, yy = pass == 0 ? (int)y : std::clamp((int)y + k, 0, res - 1);
-                a += dimg[(size_t)yy * res + xx];
-              }
-              tmp[(size_t)y * res + x] = a / (2 * rad + 1);
-            }
-        });
-        dimg.swap(tmp);
-      }
+      // running sums (in double, so they do not drift), with the image edge repeated: along rows, then columns
+      float inv = 1.f / (2 * rad + 1);
+      parallel_for(res, 4, [&](int64_t y0, int64_t y1) {
+        for (int64_t y = y0; y < y1; y++) {
+          const float* row = &dimg[(size_t)y * res];
+          double a = 0;
+          for (int k = -rad; k <= rad; k++) a += row[std::clamp(k, 0, res - 1)];
+          for (int x = 0; x < res; x++) {
+            tmp[(size_t)y * res + x] = (float)a * inv;
+            a += (double)row[std::min(x + 1 + rad, res - 1)] - row[std::max(x - rad, 0)];
+          }
+        }
+      });
+      parallel_for(res, 64, [&](int64_t x0, int64_t x1) {
+        std::vector<double> a(x1 - x0, 0.0);
+        for (int k = -rad; k <= rad; k++)
+          for (int64_t x = x0; x < x1; x++) a[x - x0] += tmp[(size_t)std::clamp(k, 0, res - 1) * res + x];
+        for (int y = 0; y < res; y++) {
+          const float* add = &tmp[(size_t)std::min(y + 1 + rad, res - 1) * res];
+          const float* sub = &tmp[(size_t)std::max(y - rad, 0) * res];
+          for (int64_t x = x0; x < x1; x++) {
+            dimg[(size_t)y * res + x] = (float)a[x - x0] * inv;
+            a[x - x0] += (double)add[x] - sub[x];
+          }
+        }
+      });
       std::vector<float> avgdiv(ss.size());
       from_image(ss, dimg.data(), 1, avgdiv.data());
-      for (size_t i = 0; i < ss.size(); i++) {
-        float c = clampf(ss.curvature[i] * 2.f - 1.f, -0.999f, 0.999f);
-        float pre = 0.5f * std::log((1.f + c) / (1.f - c));  // atanh
-        pre += avgdiv[i] * rc * s.curvature * bs.curvature_gain;
-        ss.curvature[i] = 0.5f + 0.5f * std::tanh(pre);
-      }
+      parallel_for((int64_t)ss.size(), [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; i++) {
+          float c = clampf(ss.curvature[i] * 2.f - 1.f, -0.999f, 0.999f);
+          float pre = 0.5f * std::log((1.f + c) / (1.f - c));  // atanh
+          pre += avgdiv[i] * rc * s.curvature * bs.curvature_gain;
+          ss.curvature[i] = 0.5f + 0.5f * std::tanh(pre);
+        }
+      });
     }
   }
 

@@ -19,10 +19,12 @@ struct BVH {
 
   void build(const std::vector<vec3>& pos, const std::vector<uint32_t>& idx);
   bool empty() const { return nodes.empty(); }
+  // Which side of a triangle a ray may hit: its front (geometric normal against the ray) or its back.
+  enum Facing { kAny, kFront, kBack };
   // Any hit with tmin < t < tmax.
-  bool occluded(vec3 o, vec3 d, float tmin, float tmax) const;
+  bool occluded(vec3 o, vec3 d, float tmin, float tmax, Facing facing = kAny) const;
   // Closest hit; returns false if none. `tri` is the original triangle index.
-  bool intersect(vec3 o, vec3 d, float tmin, float tmax, float& t, uint32_t& tri, float& u, float& v) const;
+  bool intersect(vec3 o, vec3 d, float tmin, float tmax, float& t, uint32_t& tri, float& u, float& v, Facing facing = kAny) const;
 };
 
 }  // namespace pt

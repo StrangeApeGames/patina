@@ -85,12 +85,23 @@ struct Baked {
   uint64_t key = 0;
 };
 
+// Where the ray-traced maps (AO, thickness, high -> low projection, bevel) are computed. Like Painter's
+// "GPU raytracing" option: the GPU when there is one, otherwise (or when it fails mid-bake) all CPU cores.
+// Both run the same estimators and agree up to float rounding; stats report which one ran.
+enum class BakeDevice {
+  Auto,  // GPU if available (see Gpu::get) and the bake is big enough to pay for starting it
+  Cpu,
+  Gpu,   // fail instead of falling back
+};
+
 // res_per_set.size() == mesh->set_names.size(). cache_dir may be empty (no disk cache).
 std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::vector<int>& res_per_set, const BakeSettings& s,
-                                 const std::string& cache_dir, bool force);
+                                 const std::string& cache_dir, bool force, BakeDevice device = BakeDevice::Auto);
 
+class Gpu;
 // Normal bake (bake_normal.cpp): fills SampleSet::nmap/nmiss and adds normal-derived curvature.
-void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& s, Json& stats);
+// gpu = null bakes on the CPU.
+void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& s, Json& stats, Gpu* gpu);
 // Edge-aware 3x3 smoothing of per-sample scalars (never across UV gaps or distant surfaces).
 void denoise_samples(const SampleSet& ss, std::vector<float>& v);
 

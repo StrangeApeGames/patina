@@ -10,6 +10,7 @@
 #include "bake.h"
 #include "eval.h"
 #include "export.h"
+#include "gpu.h"
 #include "image.h"
 #include "library.h"
 #include "mesh.h"
@@ -254,10 +255,85 @@ CommandOutput cmd_validate(const Json& a) {
   return o;
 }
 
+// bake --verify: bakes on the GPU and on the CPU, without caches, and reports how far apart the maps are.
+// The two run the same estimators, so anything beyond float rounding (a ray or two flipping at a silhouette)
+// points at a driver problem; PATINA_GPU=0 then keeps bakes on the CPU.
+Json verify_bake(const Project& p, int res_override) {
+  Json r = Json::object();
+  Gpu* gpu = Gpu::get();
+  if (!gpu) {
+    r.set("gpu", Json());
+    r.set("reason", Gpu::unavailable_reason());
+    return r;
+  }
+  auto mesh = get_mesh(p.mesh_path());
+  std::vector<int> res;
+  for (auto& s : mesh->set_names) res.push_back(res_override > 0 ? std::min(res_override, p.set_resolution(s)) : p.set_resolution(s));
+  BakeSettings bs = p.bake_settings();
+  Timer t;
+  auto g = bake_mesh(mesh, res, bs, "", true, BakeDevice::Gpu);
+  double gpu_ms = t.ms();
+  t = Timer();
+  auto c = bake_mesh(mesh, res, bs, "", true, BakeDevice::Cpu);
+  double cpu_ms = t.ms();
+
+  struct Diff {
+    double sum = 0, max = 0;
+    int64_t n = 0, over = 0;
+    void add(double d, double limit) { sum += d; max = std::max(max, d); n++; over += d > limit; }
+    Json json(const char* unit) const {
+      Json j = Json::object();
+      j.set(strf("mean_%s", unit), n ? sum / n : 0.0);
+      j.set(strf("max_%s", unit), max);
+      j.set("outliers", n ? (double)over / n : 0.0);
+      return j;
+    }
+  };
+  // outliers: texels more than 2/255 (scalar maps) or 1 degree (normals) apart
+  Diff ao, thickness, curvature, normal;
+  int64_t miss_flips = 0;
+  for (size_t si = 0; si < g->sets.size(); si++) {
+    const SampleSet &a = g->sets[si], &b = c->sets[si];
+    for (size_t i = 0; i < a.size(); i++) {
+      ao.add(std::fabs(a.ao[i] - b.ao[i]), 2.0 / 255);
+      thickness.add(std::fabs(a.thickness[i] - b.thickness[i]), 2.0 / 255);
+      curvature.add(std::fabs(a.curvature[i] - b.curvature[i]), 2.0 / 255);
+    }
+    for (size_t i = 0; i < a.nmap.size(); i++) {
+      normal.add(std::acos(clampf(dot(a.nmap[i], b.nmap[i]), -1.f, 1.f)) * 180.0 / kPi, 1.0);
+      miss_flips += a.nmiss[i] != b.nmiss[i];
+    }
+  }
+  Json maps = Json::object();
+  maps.set("ao", ao.json("diff"));
+  maps.set("thickness", thickness.json("diff"));
+  maps.set("curvature", curvature.json("diff"));
+  if (normal.n) {
+    Json nj = normal.json("degrees");
+    nj.set("miss_flips", miss_flips);
+    maps.set("normal", nj);
+  }
+  double worst = 0;
+  for (const Diff* d : {&ao, &thickness, &curvature, &normal}) worst = std::max(worst, d->n ? (double)d->over / d->n : 0.0);
+  r.set("gpu", strf("%s (%s)", gpu->name().c_str(), gpu->backend()));
+  r.set("ok", worst < 0.005);  // under 0.5% outlier texels in every map
+  r.set("gpu_ms", gpu_ms);
+  r.set("cpu_ms", cpu_ms);
+  r.set("speedup", cpu_ms / std::max(gpu_ms, 1e-3));
+  r.set("maps", maps);
+  return r;
+}
+
 CommandOutput cmd_bake(const Json& a) {
   Project p = load_project_arg(a);
   Json stats;
   int res = a.integer("resolution", 0);
+  if (a.boolean("verify", false)) {
+    CommandOutput o;
+    o.result = Json::object();
+    o.result.set("verify", verify_bake(p, res));
+    return o;
+  }
   auto bk = get_bake(p, res, a.boolean("force", false), &stats);
   CommandOutput o;
   o.result = Json::object();

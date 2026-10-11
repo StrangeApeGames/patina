@@ -312,7 +312,15 @@ sit on top. It also feeds the curvature map, so `edge_wear` and dirt follow bake
 
 - Check `render(mode="bake_normal")`, `render(mode="bake_misses")` and `render(mode="bake_ao")` before texturing.
 - Misses in one area only? Paint the cage there (`cage_mask`) instead of growing it everywhere, which invites bleed from neighbouring surfaces.
+- Misses under a detail that rests on a surface (a bolt head, a strap) mean rays start inside it: the cage must clear the tallest detail.
 - `bake` reports groups, misses and warnings (for example, a low part with no `_high` partner).
 - Low-poly rules still apply: triangulate, split UVs at hard edges, keep the high poly inside the cage.
 - A bevel-only bake is the fast path for hard-surface lows without a high poly: rounded edges and edge wear in one line.
+
+**GPU baking.** AO, thickness, the high-to-low projection and the bevel are ray traced on the GPU when the machine
+has one (Windows, Direct3D 11) and on all CPU cores otherwise; `bake` reports which in `stats.device`. Nothing
+needs configuring: a GPU that fails mid-bake falls back to the CPU (`stats.gpu_error`), and both devices run the
+same estimators, so their maps agree to float rounding. `bake(verify=true)` (`patina bake <project> --verify`)
+bakes both ways and reports per-map differences, `ok` and the speedup. `PATINA_GPU=0` keeps every bake on the
+CPU, for output that does not depend on a GPU or its driver; `PATINA_GPU=<part of an adapter name>` picks a GPU.
 

@@ -221,12 +221,16 @@ static inline bool hit_tri(const BVH::Tri& tr, vec3 o, vec3 d, float tmin, float
   return t > tmin && t < tmax;
 }
 
+static inline bool faces(const BVH::Tri& tr, vec3 d, BVH::Facing facing) {
+  return facing == BVH::kAny || (dot(cross(tr.e1, tr.e2), d) > 0.f) == (facing == BVH::kBack);
+}
+
 static inline vec3 safe_inv(vec3 d) {
   auto f = [](float x) { return std::fabs(x) > 1e-20f ? 1.0f / x : (x >= 0 ? 1e20f : -1e20f); };
   return {f(d.x), f(d.y), f(d.z)};
 }
 
-bool BVH::occluded(vec3 o, vec3 d, float tmin, float tmax) const {
+bool BVH::occluded(vec3 o, vec3 d, float tmin, float tmax, Facing facing) const {
   if (nodes.empty()) return false;
   vec3 inv = safe_inv(d);
   uint32_t stack[64];
@@ -239,7 +243,7 @@ bool BVH::occluded(vec3 o, vec3 d, float tmin, float tmax) const {
     if (n.count) {
       float t, u, v;
       for (uint32_t i = n.left_first; i < n.left_first + n.count; i++)
-        if (hit_tri(tris[i], o, d, tmin, tmax, t, u, v)) return true;
+        if (hit_tri(tris[i], o, d, tmin, tmax, t, u, v) && faces(tris[i], d, facing)) return true;
       if (sp == 0) return false;
       ni = stack[--sp];
       continue;
@@ -260,7 +264,7 @@ bool BVH::occluded(vec3 o, vec3 d, float tmin, float tmax) const {
   }
 }
 
-bool BVH::intersect(vec3 o, vec3 d, float tmin, float tmax, float& t_out, uint32_t& tri, float& u_out, float& v_out) const {
+bool BVH::intersect(vec3 o, vec3 d, float tmin, float tmax, float& t_out, uint32_t& tri, float& u_out, float& v_out, Facing facing) const {
   if (nodes.empty()) return false;
   vec3 inv = safe_inv(d);
   struct Entry { uint32_t node; float t; };
@@ -278,7 +282,7 @@ bool BVH::intersect(vec3 o, vec3 d, float tmin, float tmax, float& t_out, uint32
     if (n.count) {
       for (uint32_t i = n.left_first; i < n.left_first + n.count; i++) {
         float t, u, v;
-        if (hit_tri(tris[i], o, d, tmin, best, t, u, v)) {
+        if (hit_tri(tris[i], o, d, tmin, best, t, u, v) && faces(tris[i], d, facing)) {
           best = t; found = true; tri = tri_id[i]; u_out = u; v_out = v;
         }
       }

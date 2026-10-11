@@ -23,6 +23,11 @@ Items marked *(unverified)* came from third-party sources or convention, not off
   - Curvature, from an edge integral over dihedral angles.
   - Position, normals and UV islands, taken straight from the surface samples.
 
+**GPU baking**
+- Painter added GPU raytracing for the AO and thickness bakers in 2019.2: DXR when available, otherwise OptiX. It can be turned off in the baking options, which is also the advice when a high poly does not fit in video memory and the bake fails ([2019.2 notes](https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/release-notes/old-versions/version-2019-2)). Adobe puts the gain at 25x or more ([GPU raytracing](https://helpx.adobe.com/substance-3d-bake/features/gpu-raytracing.html), *unverified*: the page did not load, the figure is from a search summary).
+- Toolbag's baker is GPU-accelerated, sorts meshes into bake groups, and has painted cage offset and skew ([baking](https://marmoset.co/toolbag/baking)). Toolbag 4 gave it a new ray tracing backend with native support for RTX cards that also runs on "all modern GPUs" ([CG Channel](https://www.cgchannel.com/2021/04/marmoset-ships-toolbag-4-0/)).
+- **Patina:** the ray-traced maps (AO, thickness, high-to-low projection, bevel) run in compute shaders with a software BVH, so any DX11 GPU works, like Toolbag's backend on cards without ray tracing hardware. The CPU baker stays as the reference, as in Painter: it takes over when there is no GPU or the GPU fails, without a setting to flip, and `bake --verify` compares the two.
+
 **Blend modes**
 - About 25 standard modes, plus Normal Map Combine/Detail (Whiteout/RNM) for normals, all in linear space ([list](https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/interface/layer-stack/blending-modes)).
 - **Patina:** 13 standard modes, plus `combine` (RNM) for normals.
@@ -81,6 +86,7 @@ These tools generate color images. They don't give editable, layered, determinis
 1. **Headless by default, CPU first.**
    - Agents run on servers and in CI; a GPU and a window are optional.
    - Everything (bake, evaluate, render) runs on all CPU cores.
+   - The baker also runs its ray tracing on a GPU when there is one. The CPU path is the reference: the GPU kernels mirror it statement by statement and must match it to float rounding.
    - The viewer uses the GPU only to put the CPU-rendered frame on screen, so humans and agents see identical pixels.
 2. **Declarative documents over imperative sessions.**
    - A project file is the whole state. Edits are JSON ops validated by evaluation before saving.

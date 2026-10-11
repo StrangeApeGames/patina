@@ -10,7 +10,8 @@ layer stacks:
 - 3D paint strokes and projected decals
 
 It ships as one native C++ binary for **macOS and Windows** with a **CLI**, an **MCP server** and a
-**native viewer**. There is no GUI to drive, no web stack and no GPU requirement.
+**native viewer**. There is no GUI to drive and no web stack, and a GPU is optional: bakes are ray traced on
+one when it is there and on every CPU core when it is not.
 
 ![sci-fi panel textured by Patina](docs/images/panel.png)
 
@@ -22,8 +23,9 @@ Substance Painter is built for people with a mouse. Agents need:
 |---|---|
 | A way to express intent | A **declarative project file**: every layer, mask and parameter is JSON an agent can read, diff and patch. |
 | Eyes | A **built-in renderer** that returns images the agent can look at: lit PBR, clay, per-channel, and "where does this layer apply" mask views. About 100 ms per preview. |
-| Reproducibility | **Deterministic output**: the same project gives bit-identical textures every time. |
+| Reproducibility | **Deterministic output**: the same project gives bit-identical textures every time. (GPU and CPU bakes agree to float rounding, not to the bit; `PATINA_GPU=0` pins the CPU.) |
 | Scale | **Parallelism everywhere**: baking, evaluation, rendering and PNG encoding use every core, MCP tool calls run concurrently, and `batch`/`variants` fan out across assets and alternatives. |
+| Bakes that don't interrupt the loop | A **GPU baker**: AO, thickness, the high-to-low projection and the bevel are ray traced in compute shaders, about 10x faster than 32 CPU threads end to end, with an automatic CPU fallback and `bake --verify` to compare the two. |
 | No UV seams | **3D procedural noise evaluated at the surface position**, so noise is seamless across seams. |
 | Normal maps without the fuss | A **high-to-low normal baker** with automatic cage, automatic anti-skew and `_low`/`_high` name matching (no bleed between parts), plus a **bevel shader** that bakes rounded edges from the low poly alone. MikkTSpace throughout. |
 | Engine-ready output | Export presets for Blender, glTF (ORM), Unreal, Unity HDRP/URP and Godot, plus a textured `.glb` and a Blender bridge that builds the materials. |
@@ -60,6 +62,29 @@ Measured on an M5 Pro (6P + 12E cores) at 2048² per texture set:
 - Previews evaluate at 1024² by default: about 0.1–0.4 s per edit-render loop.
 - Bakes are cached in memory and on disk (`.patina/`).
 - A 5-asset cold `batch` export at 2K finishes in about 6 s of wall time.
+
+**GPU baking.** On Windows the ray-traced maps are baked in Direct3D 11 compute shaders, so any DX11 GPU
+works (as Toolbag's ray tracing backend does on cards without ray tracing hardware), with the CPU baker as
+reference and fallback (as Painter keeps CPU raytracing for when GPU raytracing is off). Cold bakes on an
+RTX 4070 Ti SUPER, against the same build on the 32 threads of a Ryzen 9 7950X3D:
+
+| Asset | Resolution | CPU | GPU | |
+|-------|-----------|-----|-----|---|
+| Suzanne (15.7k tris) | 2048² | 2.24 s | 0.30 s | 7.5x |
+| Suzanne | 4096² | 8.5 s | 0.70 s | 12x |
+| Beer barrel (43k tris, 6 texture sets) | 6 × 2048² | 15.0 s | 1.26 s | 12x |
+| Beer barrel | 6 × 4096² | 57.9 s | 4.3 s | 13x |
+| Bolt plate, high-to-low normals + bevel shader + AO from the high poly | 2 × 2048² | 9.8 s | 1.2 s | 8x |
+
+- AO and thickness alone are 25–30x faster (Suzanne at 2K: 2.1 s to 0.08 s). What remains is CPU work:
+  rasterizing the UVs, curvature and filtering, plus about 0.2 s for the driver to start, most of it hidden
+  behind the rasterizer. Bakes under 512² texels in total stay on the CPU, which finishes them sooner.
+- Both devices run the same estimators with the same sample sequences. `patina bake <project> --verify` bakes on
+  both and reports how far apart each map is; the test suite runs it on its AO, projection and bevel projects.
+- Any failure on the GPU (driver reset, out of video memory) re-bakes on the CPU and is reported in the stats.
+- `PATINA_GPU=0` turns the GPU off, `PATINA_GPU=<part of an adapter name>` picks one, and `PATINA_GPU=warp` uses
+  Direct3D's software rasterizer, which is how the tests exercise the kernels on machines without a GPU.
+  macOS bakes on the CPU for now.
 
 ## Install
 
@@ -98,6 +123,8 @@ bash tests/run_tests.sh      # end-to-end suite (~3 s)
 
 On Windows, run these from a "x64 Native Tools Command Prompt for VS 2022" (or a Developer PowerShell
 with `-arch=x64`) so `cl` is on the path, and run the tests from Git Bash. The binary is `build\patina.exe`.
+The build compiles the GPU bake kernels (`src/shaders/bake.hlsl`) with the Windows SDK's `fxc`, which sits
+next to `rc.exe`; nothing is compiled at run time.
 
 CI builds and tests on macOS (clang) and Windows (MSVC) on every push.
 
@@ -186,6 +213,9 @@ patina guide                                                            # the ag
 | `src/mesh.*` | glTF/GLB/OBJ loading, tangents, UV islands, inspection |
 | `src/bvh.*` | SAH BVH with early split clipping |
 | `src/bake.*` | UV rasterization with gutter samples, AO and thickness (ray traced on a subsampled lattice), edge-integral curvature, padding, disk cache |
+| `src/bake_normal.cpp` | high-to-low normal projection (cage, skew, bake groups), bevel shader, AO from the high poly |
+| `src/gpu.*`, `src/bake_gpu.*` | GPU compute layer (Direct3D 11) and the host side of the bake kernels |
+| `src/shaders/bake.hlsl` | the bake kernels: BVH traversal and the ray-traced estimators, mirroring the CPU ones |
 | `src/eval.*` | fields, generators, mask stacks, blend modes, height→normal |
 | `src/library.cpp` | smart materials (parameterized templates) and export presets |
 | `src/render.*` | tiled CPU PBR rasterizer and contact sheets |

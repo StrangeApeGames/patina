@@ -26,7 +26,8 @@ usage: patina <command> [args] [--flags]      (all commands print JSON)
   get      <project> [--outline]               print the project (or a compact outline)
   edit     <project> <ops.json | - | '[{...}]'> apply edit ops (see `patina library`)
   validate <project>                           check for errors/typos
-  bake     <project> [--force] [--preview]     bake AO/curvature/thickness (cached)
+  bake     <project> [--force] [--preview]     bake AO/curvature/thickness/normals (cached; on the GPU when there is one)
+  bake     <project> --verify                  bake on the GPU and the CPU and compare the maps
   render   <project> [-o out.png] [--views iso,front] [--mode lit] [--size 512] [--sheet]
   variants <project> <variants.json>           render alternatives side by side
   export   <project> [--preset blender|gltf|unreal|unity_hdrp|unity_urp|godot|maps] [-o dir] [--glb]
@@ -43,7 +44,8 @@ usage: patina <command> [args] [--flags]      (all commands print JSON)
   update   [--check] [--force]                 install the latest release (verified) and refresh the skill
   version                                      print the version and whether an update is available
 
-environment: PATINA_THREADS, PATINA_LIBRARY (extra smart material dirs), PATINA_BLENDER,
+environment: PATINA_THREADS, PATINA_GPU (0 = bake on the CPU, or part of an adapter name),
+             PATINA_LIBRARY (extra smart material dirs), PATINA_BLENDER,
              PATINA_HOME (install dir, default ~/.patina), PATINA_NO_UPDATE_CHECK
 )";
 
