@@ -250,14 +250,15 @@ ok "mcp smoke (concurrent calls)"
 
 # install + update into a sandbox home (no PATH or MCP registration); the "release" is served over file:// URLs
 EXE="$BIN"; [ -f "$EXE.exe" ] && EXE="$EXE.exe"
-export PATINA_HOME="$W/home/.patina" CLAUDE_CONFIG_DIR="$W/home/.claude"
+export PATINA_HOME="$W/home/.patina" CLAUDE_CONFIG_DIR="$W/home/.claude" CODEX_HOME="$W/home/.codex"
 "$BIN" install --no-path --no-mcp --compact >/dev/null || fail "install"
 for f in "$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md" "$CLAUDE_CONFIG_DIR/skills/patina/AGENT_GUIDE.md" \
+         "$CODEX_HOME/skills/patina/SKILL.md" "$CODEX_HOME/skills/patina/AGENT_GUIDE.md" \
          "$PATINA_HOME/tools/blender/patina_blender.py"; do
   [ -f "$f" ] || fail "install did not write $f"
 done
 grep -q '^name: patina$' "$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md" || fail "skill frontmatter"
-ok "install (binary, skill, blender bridge)"
+ok "install (binary, Claude Code and Codex skills, blender bridge)"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) ASSET=patina-windows-x64.exe ;;
   Darwin) [ "$(uname -m)" = arm64 ] && ASSET=patina-macos-arm64 || ASSET= ;;
@@ -282,9 +283,32 @@ EOF
   export PATINA_RELEASES_API=$(release_json 0000000000000000000000000000000000000000000000000000000000000000)
   set +e; out=$("$BIN" update --no-path --no-mcp --compact); code=$?; set -e
   [ $code -ne 0 ] && echo "$out" | grep -q "checksum mismatch" || fail "bad checksum must be rejected"
-  unset PATINA_RELEASES_API
   ok "update: check, verified install, checksum mismatch rejected"
+
+  # The MCP server only looks for a newer release; installing is left to `update`. It must never download or
+  # install by itself: Windows Defender removes a binary that does (see src/selfupdate.cpp).
+  INSTALLED="$PATINA_HOME/bin/$(basename "$EXE")"
+  SKILL="$CLAUDE_CONFIG_DIR/skills/patina/SKILL.md"
+  STATE="$PATINA_HOME/update_check.json"
+  INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+  unset PATINA_NO_UPDATE_CHECK
+  export PATINA_RELEASES_API=$(release_json)
+  rm -f "$STATE" "$SKILL"
+  ( echo "$INIT"; for _ in $(seq 150); do [ -s "$STATE" ] && break; sleep 0.2; done ) | "$INSTALLED" mcp >/dev/null
+  [ "$(json "d['latest']" < "$STATE")" = "99.0.0" ] || fail "the MCP server did not record the newer release"
+  [ ! -f "$SKILL" ] && [ -z "$(ls "$PATINA_HOME/downloads" 2>/dev/null)" ] || fail "the MCP server must not install anything by itself"
+  said=$(echo "$INIT" | "$INSTALLED" mcp | json "d['result']['instructions']")
+  [[ "$said" == *"99.0.0 is available"* && "$said" == *"in a shell"* ]] || fail "the installed server must ask the agent to update"
+  said=$(echo "$INIT" | "$BIN" mcp | json "d['result']['instructions']")
+  [[ "$said" == *"99.0.0 is available"* && "$said" != *"in a shell"* ]] || fail "a build that is not the installed copy must only mention the release"
+  [[ "$("$INSTALLED" version)" == *"99.0.0 is available"* ]] || fail "version must announce the release"
+  export PATINA_NO_UPDATE_CHECK=1
+  rm -f "$STATE"
+  echo "$INIT" | "$INSTALLED" mcp >/dev/null; sleep 1
+  [ ! -f "$STATE" ] || fail "PATINA_NO_UPDATE_CHECK must stop the check"
+  unset PATINA_RELEASES_API
+  ok "update notice: the server only checks and asks the agent to update, opt-out"
 fi
-unset PATINA_HOME CLAUDE_CONFIG_DIR
+unset PATINA_HOME CLAUDE_CONFIG_DIR CODEX_HOME
 
 echo "== $pass passed"

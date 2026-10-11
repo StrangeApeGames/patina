@@ -11,6 +11,7 @@
 #include "commands.h"
 #include "core.h"
 #include "json.h"
+#include "selfupdate.h"
 
 #if defined(_WIN32)
 #include <fcntl.h>
@@ -223,9 +224,8 @@ int run_mcp_server() {
       info.set("name", "patina");
       info.set("version", patina_version());
       r.set("serverInfo", info);
-      std::string notice = update_notice();
-      r.set("instructions", notice.empty() ? std::string(kInstructions)
-                                           : std::string(kInstructions) + "\n\n" + notice + " Mention this to the user.");
+      std::string request = update_request();
+      r.set("instructions", request.empty() ? std::string(kInstructions) : std::string(kInstructions) + "\n\n" + request);
       send_result(id, r);
     } else if (method == "ping") {
       if (is_request) send_result(id, Json::object());
