@@ -1,6 +1,6 @@
-# Installs the latest Patina release (binary, Claude Code skill, MCP server):
+# Installs the latest Patina release (the binary, plus the skill and MCP server for Claude Code and Codex):
 #   irm https://raw.githubusercontent.com/parodyband/patina/main/install.ps1 | iex
-# Afterwards, `patina update` keeps it current.
+# Afterwards `patina update` keeps it current; its MCP server tells your agent when to run it.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # the progress bar makes Invoke-WebRequest very slow on PowerShell 5
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12

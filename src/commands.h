@@ -5,6 +5,8 @@
 #include "eval.h"
 #include "json.h"
 
+#define TOOL_NS pt  // the namespace the code shared with Chisel (selfupdate.h) is compiled into
+
 namespace pt {
 
 struct CommandOutput {
@@ -20,14 +22,10 @@ const char* agent_guide();  // docs/AGENT_GUIDE.md, embedded at build time
 const char* mcp_instructions();  // the MCP server's instructions (also used in the installed skill)
 std::string shell_quote(const std::string& s);
 
-// install / update (update.cpp)
+// tool.cpp (install and update are in selfupdate.h)
 const char* patina_version();
 std::string patina_home();              // ~/.patina, or $PATINA_HOME
 std::string installed_bridge_script();  // <home>/tools/blender/patina_blender.py, written if missing
-CommandOutput cmd_install(const Json& args);
-CommandOutput cmd_update(const Json& args);
-void start_update_check();   // background check for a newer release, at most once a day
-std::string update_notice();  // "Patina X is available ..." from the last check, or ""
 
 // Load + bake (cached) + evaluate a project into padded maps (used by the viewer).
 struct EvaluatedProject {

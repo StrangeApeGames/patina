@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(patina VERSION 0.4.1 LANGUAGES C CXX)
+project(patina VERSION 0.5.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,7 +44,8 @@ add_library(patina_core STATIC
   src/project.cpp
   src/commands.cpp
   src/mcp.cpp
-  src/update.cpp
+  src/selfupdate.cpp
+  src/tool.cpp
 )
 target_include_directories(patina_core PUBLIC src third_party)
 

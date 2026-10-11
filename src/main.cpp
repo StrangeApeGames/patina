@@ -7,6 +7,7 @@
 #include "commands.h"
 #include "core.h"
 #include "json.h"
+#include "selfupdate.h"
 
 namespace pt {
 int run_mcp_server();
@@ -40,8 +41,8 @@ usage: patina <command> [args] [--flags]      (all commands print JSON)
   mcp                                          run the MCP server on stdio
   view     <project>                           native viewer window (live reload)
   bench    <mesh> [--resolution 2048]          performance benchmark
-  install  [--no-skill] [--no-mcp] [--no-path] install to ~/.patina/bin + Claude Code skill + MCP server
-  update   [--check] [--force]                 install the latest release (verified) and refresh the skill
+  install  [--no-skill] [--no-mcp] [--no-path] install to ~/.patina/bin + skill and MCP server for Claude Code and Codex
+  update   [--check] [--force]                 install the latest release (the MCP server tells the agent when one is out)
   version                                      print the version and whether an update is available
 
 environment: PATINA_THREADS, PATINA_GPU (0 = bake on the CPU, or part of an adapter name),
