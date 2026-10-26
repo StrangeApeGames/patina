@@ -1,7 +1,7 @@
 // Install, self-update and the agent skills.
 //
-// Shared code: this file and selfupdate.h are identical in Patina (github.com/parodyband/patina) and Chisel
-// (github.com/parodyband/chisel), so change both copies together. What differs between the tools is in each
+// Shared code: this file and selfupdate.h are identical in Patina (github.com/StrangeApeGames/patina) and Mirette
+// (github.com/StrangeApeGames/mirette), so change both copies together. What differs between the tools is in each
 // one's tool.cpp.
 //
 //   <tool> install   copies this binary to ~/.<tool>/bin, puts that folder on the user's PATH and sets up every
@@ -20,7 +20,9 @@
 // trojan (Trojan:Win32/Bearfoos.A!ml), and Defender removed every copy of the binary. The same download run by
 // `update` from a shell is not flagged.
 //
-// Downloads go through the system curl (built into macOS and Windows 10+).
+// Downloads go through the system curl (built into macOS and Windows 10+). A private repo refuses requests
+// without a login, so when the anonymous request fails and GitHub's CLI (`gh`) is installed, the release is
+// fetched through `gh` instead, with the user's own GitHub login.
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -211,19 +213,56 @@ bool is_newer(const std::string& candidate, const std::string& current) {
 }
 
 struct Release {
-  std::string version, page, asset_url, sums_url;
+  std::string version, tag, page, asset_url, sums_url;
+  bool via_gh = false;  // the repo is private: download through `gh` too
 };
+
+// Asks GitHub's CLI, signed in as the user, for a private repo's latest release.
+std::string gh_latest_release() {
+  if (!has_command("gh"))
+    fail("cannot reach the releases of %s. If the repo is private, install GitHub's CLI (https://cli.github.com) and "
+         "sign in with `gh auth login` as someone who can see it, then try again",
+         tool_info().repo);
+  int status = 0;
+  std::string body = run_capture(strf("gh api repos/%s/releases/latest", tool_info().repo), &status);
+  if (status != 0)
+    fail("cannot reach the releases of %s, even through gh. Check `gh auth status`: the account must be able to see "
+         "the repo (for StrangeApeGames repos, be a member of the organisation)",
+         tool_info().repo);
+  return body;
+}
+
+// gh release download; `file` "-" writes to stdout, which is returned.
+std::string gh_download(const Release& rel, const char* name, const std::string& file) {
+  for (char c : rel.tag)  // the tag comes from the release JSON and goes onto a command line
+    if (!std::isalnum((unsigned char)c) && c != '.' && c != '-' && c != '_') fail("unexpected release tag: %s", rel.tag.c_str());
+  int status = 0;
+  std::string out = run_capture(strf("gh release download %s --repo %s --pattern %s --clobber --output %s", rel.tag.c_str(),
+                                     tool_info().repo, name, file == "-" ? "-" : quote(file).c_str()),
+                                &status);
+  if (status != 0) fail("download failed: %s from %s %s (through gh)", name, tool_info().repo, rel.tag.c_str());
+  return out;
+}
 
 Release fetch_latest_release(int timeout_s) {
   Json j;
   std::string err;
   // <TOOL>_RELEASES_API points at another release JSON (forks, tests; curl also accepts file:// URLs)
   std::string api = tool_env("RELEASES_API");
-  if (api.empty()) api = strf("https://api.github.com/repos/%s/releases/latest", tool_info().repo);
-  std::string body = http_get(api, timeout_s);
-  if (!Json::try_parse(body, j, err)) fail("unexpected response from the GitHub releases API");
+  bool custom = !api.empty();
+  if (!custom) api = strf("https://api.github.com/repos/%s/releases/latest", tool_info().repo);
   Release r;
-  r.version = j.str("tag_name");
+  std::string body;
+  try {
+    body = http_get(api, timeout_s);
+  } catch (const Error&) {
+    if (custom) throw;
+    body = gh_latest_release();  // a private repo answers 404 to a request without a login
+    r.via_gh = true;
+  }
+  if (!Json::try_parse(body, j, err)) fail("unexpected response from the GitHub releases API");
+  r.tag = j.str("tag_name");
+  r.version = r.tag;
   if (!r.version.empty() && (r.version[0] == 'v' || r.version[0] == 'V')) r.version.erase(0, 1);
   r.page = j.str("html_url");
   for (auto& a : j["assets"].items()) {
@@ -454,9 +493,14 @@ Json download_and_install(const Release& rel, const std::string& install_flags) 
   std::string dir = path_join(tool_home(), "downloads");
   make_dirs(dir);
   std::string file = path_join(dir, strf("%d-%s", process_id(), asset_name()));  // per process: updates can overlap
-  http_download(rel.asset_url, file);
-
-  std::string data, sums = http_get(rel.sums_url, 30);
+  std::string data, sums;
+  if (rel.via_gh) {
+    gh_download(rel, asset_name(), file);
+    sums = gh_download(rel, "SHA256SUMS.txt", "-");
+  } else {
+    http_download(rel.asset_url, file);
+    sums = http_get(rel.sums_url, 30);
+  }
   if (!read_file(file, data)) fail("cannot read %s", file.c_str());
   if (listed_digest(sums, asset_name()) != sha256_hex(data.data(), data.size())) {
     std::remove(file.c_str());

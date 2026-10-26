@@ -15,7 +15,7 @@ const ToolInfo& tool_info() {
       .name = "patina",
       .title = "Patina",
       .version = PATINA_VERSION,
-      .repo = "parodyband/patina",
+      .repo = "StrangeApeGames/patina",
       .env = "PATINA",
       .asset_windows_x64 = "patina-windows-x64.exe",  // see .github/workflows/build.yml
       .asset_macos_arm64 = "patina-macos-arm64",

@@ -93,11 +93,11 @@ RTX 4070 Ti SUPER, against the same build on the 32 threads of a Ryzen 9 7950X3D
 Paste this to your agent (Claude Code, Codex, or anything else with a shell):
 
 ```text
-Install Patina for me (https://github.com/parodyband/patina).
+Install Patina for me (https://github.com/StrangeApeGames/patina).
 
 1. Run the installer for this machine:
-   - Windows: powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/parodyband/patina/main/install.ps1 | iex"
-   - macOS (Apple silicon): curl -fsSL https://raw.githubusercontent.com/parodyband/patina/main/install.sh | sh
+   - Windows: powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/StrangeApeGames/patina/main/install.ps1 | iex"
+   - macOS (Apple silicon): curl -fsSL https://raw.githubusercontent.com/StrangeApeGames/patina/main/install.sh | sh
    It downloads the latest release, checks its SHA-256 and prints JSON describing what it set up.
 2. In that JSON, find yourself under "agents" and check that "registered" is true. If you are not listed, or it
    is false, add the MCP server under "mcp_server" to your own configuration.
@@ -107,11 +107,11 @@ Install Patina for me (https://github.com/parodyband/patina).
 Or run the installer yourself:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/parodyband/patina/main/install.sh | sh      # macOS (Apple silicon)
+curl -fsSL https://raw.githubusercontent.com/StrangeApeGames/patina/main/install.sh | sh      # macOS (Apple silicon)
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/parodyband/patina/main/install.ps1 | iex           # Windows
+irm https://raw.githubusercontent.com/StrangeApeGames/patina/main/install.ps1 | iex           # Windows
 ```
 
 It puts the binary in `~/.patina/bin` (added to your PATH). For Claude Code and Codex, whichever are on the
@@ -252,7 +252,7 @@ patina guide                                                            # the ag
 | `third_party/LightUSD` | submodule: our fork of LightUSD, on the branch and commit the engine's cooker uses |
 | `src/commands.*` | command implementations shared by the CLI and MCP; session caches |
 | `src/mcp.cpp` | MCP server (stdio JSON-RPC, concurrent tool calls) |
-| `src/selfupdate.*` | `install` / `update` and the release check: installed binary, agent skills, MCP registration, verified downloads. Identical to the copy in [Chisel](https://github.com/parodyband/chisel); change both together |
+| `src/selfupdate.*` | `install` / `update` and the release check: installed binary, agent skills, MCP registration, verified downloads. Identical to the copy in [Mirette](https://github.com/StrangeApeGames/mirette); change both together |
 | `src/tool.cpp` | what `selfupdate` needs to know about Patina, and the Blender bridge an install carries |
 | `src/viewer.cpp` | sokol + Dear ImGui viewer |
 | `tools/blender/` | Blender bridge (`export` .blend→.glb, `apply` manifest→Principled BSDF) |

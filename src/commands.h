@@ -5,7 +5,7 @@
 #include "eval.h"
 #include "json.h"
 
-#define TOOL_NS pt  // the namespace the code shared with Chisel (selfupdate.h) is compiled into
+#define TOOL_NS pt  // the namespace the code shared with Mirette (selfupdate.h) is compiled into
 
 namespace pt {
 
