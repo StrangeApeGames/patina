@@ -252,7 +252,7 @@ patina guide                                                            # the ag
 | `third_party/LightUSD` | submodule: our fork of LightUSD, on the branch and commit the engine's cooker uses |
 | `src/commands.*` | command implementations shared by the CLI and MCP; session caches |
 | `src/mcp.cpp` | MCP server (stdio JSON-RPC, concurrent tool calls) |
-| `src/selfupdate.*` | `install` / `update` and the release check: installed binary, agent skills, MCP registration, verified downloads. Identical to the copy in [Chisel](https://github.com/parodyband/chisel); change both together |
+| `src/selfupdate.*` | `install` / `update` and the release check: installed binary, agent skills, MCP registration, verified downloads. Identical to the copy in [Mirette](https://github.com/parodyband/mirette); change both together |
 | `src/tool.cpp` | what `selfupdate` needs to know about Patina, and the Blender bridge an install carries |
 | `src/viewer.cpp` | sokol + Dear ImGui viewer |
 | `tools/blender/` | Blender bridge (`export` .blend→.glb, `apply` manifest→Principled BSDF) |
