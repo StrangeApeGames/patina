@@ -364,10 +364,10 @@ struct ProjIn {  // GpuProjIn
   float3 dir; float pad0;   // rays travel along -dir
   float3 pc; float pad1;    // point on the explicit cage
 };
-struct ProjOut { float3 n; uint flags; float3 hit_p; uint hit_tri; };  // GpuProjOut
+struct ProjOut { float3 n; uint flags; float3 hit_p; uint hit_tri; float height; float3 pad; };  // GpuProjOut
 #define O_MISS 1u    // most supersamples found no high-poly surface
 #define O_BEVEL 2u   // the bevel shader changed the normal
-#define O_HIT 4u     // hit_p / hit_tri hold where the texel lands on the high poly
+#define O_HIT 4u     // hit_p / hit_tri hold where the texel lands on the high poly, height its mean height
 #define O_NEAR 8u    // F_BEVEL_DETECT: a hit lies within bevel reach of a feature edge
 StructuredBuffer<ProjIn> g_in : register(t8);
 RWStructuredBuffer<ProjOut> g_out : register(u0);
@@ -380,7 +380,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   Bvh g = g_bvhs[s.group];
   uint grid = g_grid;
   float3 acc = float3(0, 0, 0);
-  uint miss = 0, flags = 0;
+  uint miss = 0, hits = 0, flags = 0;
+  float hsum = 0.0;
   float3 hit_p = float3(0, 0, 0);
   uint hit_tri = 0;
   [loop] for (uint sy = 0; sy < grid; sy++)
@@ -408,6 +409,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint orig = g_tri_orig[ref];
         nh = smooth_normal(g_attr[orig], u, v);
         float3 hp = o - s.dir * th;
+        hsum += dot(hp - p, s.ns);  // height above the low surface
+        hits++;
         // the centre supersample's hit, or another one's when it misses
         if ((g_flags & F_HIT) && ((sx == grid / 2 && sy == grid / 2) || !(flags & O_HIT))) {
           hit_p = hp;
@@ -432,6 +435,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   r.flags = flags;
   r.hit_p = hit_p;
   r.hit_tri = hit_tri;
+  r.height = hits ? hsum / (float)hits : 0.0;
+  r.pad = float3(0, 0, 0);
   g_out[i] = r;
 }
 #endif

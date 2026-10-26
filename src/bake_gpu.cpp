@@ -5,7 +5,7 @@
 namespace pt {
 
 static_assert(sizeof(GpuParams) == 64 && sizeof(GpuSample) == 48 && sizeof(GpuBevelIn) == 48, "bake.hlsl layout");
-static_assert(sizeof(GpuProjIn) == 112 && sizeof(GpuProjOut) == 32 && sizeof(GpuTriAttr) == 48, "bake.hlsl layout");
+static_assert(sizeof(GpuProjIn) == 112 && sizeof(GpuProjOut) == 48 && sizeof(GpuTriAttr) == 48, "bake.hlsl layout");
 static_assert(sizeof(BVH::Node) == 32 && sizeof(BVH::Tri) == 36, "bake.hlsl layout");
 
 uint32_t GpuScene::add(const BVH& bvh, const std::vector<uint32_t>* orig) {

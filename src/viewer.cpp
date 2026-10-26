@@ -212,7 +212,7 @@ void poll_files() {
   }
 }
 
-const char* kModes[] = {"lit", "clay", "wireframe", "basecolor", "roughness", "metallic", "normal", "height", "ao", "emissive", "curvature", "thickness", "bake_ao", "bake_normal", "bake_misses", "islands", "parts", "uv_checker"};
+const char* kModes[] = {"lit", "clay", "wireframe", "basecolor", "roughness", "metallic", "normal", "height", "ao", "emissive", "curvature", "thickness", "bake_ao", "bake_height", "bake_normal", "bake_misses", "islands", "parts", "uv_checker"};
 
 void draw_layers(const Json& layers, int depth) {
   if (!layers.is_array()) return;

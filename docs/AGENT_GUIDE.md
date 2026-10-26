@@ -9,7 +9,7 @@ This guide is everything an agent needs; `library` lists every parameter.
 | Substance Painter        | Patina                                                              |
 |--------------------------|---------------------------------------------------------------------|
 | Texture set              | `texture_sets.<MaterialName>` (one per material in the mesh)        |
-| Bake mesh maps           | automatic + cached (AO, curvature, thickness, position, normals)    |
+| Bake mesh maps           | automatic + cached (AO, curvature, thickness, position, normals, height) |
 | Fill layer               | `{"channels": {...}, "mask": [...]}`                                 |
 | Folder                   | `{"type": "folder", "layers": [...], "mask": [...]}`                 |
 | Smart material           | `{"type": "smart", "material": "painted_metal", "params": {...}}`    |
@@ -236,7 +236,7 @@ the surface, `[-0.5, 1]` leaves gaps.
     | `lit` | final look |
     | `clay` | shape / height detail |
     | `basecolor`, `roughness`, `metallic`, `normal`, `height`, `ao` | one channel |
-    | `curvature`, `thickness`, `bake_ao` | bakes |
+    | `curvature`, `thickness`, `bake_ao`, `bake_height` | bakes |
     | `mask:<id>` | where a layer applies, in red |
     | `islands`, `parts` | UV islands / mesh parts |
     | `uv_checker` | UV distortion |
@@ -267,6 +267,10 @@ the surface, `[-0.5, 1]` leaves gaps.
 
 - `manifest.json` lists every file per texture set. `blender(action="apply")` reads it.
 - The normal map already contains the height detail.
+- `bake_height=true` (CLI `--bake-height`, or `"bake_height": true` in the project's `export` block) adds
+  `{set}_bake_height.png` to any preset: the height baked from the high poly (§12), 16-bit, for parallax,
+  tessellation or displacement. The `maps` preset writes it whenever there is one. This is not the `height`
+  channel: that holds the layers' painted height and is already in the normal map, as is the baked height.
 
 ### USD
 
@@ -319,6 +323,14 @@ them): each texel is measured where it lands on the high poly, so `edge_wear`, `
 follow its bevels, bolts and creases and not the low poly's edges. Without one (bevel only), the maps come
 from the low poly and the bevelled normal adds to the curvature.
 
+A high poly also bakes a **height map**: how far the high-poly surface lies above or below the low's, for
+parallax, tessellation or displacement. 0.5 is the low surface; 0 and 1 are `height_range` below and above it,
+the same for every texture set, so they displace alike. `bake` reports the range in world units as
+`stats.height_range` (and the farthest hits as `stats.normal.height.min`/`max`), and the export manifest as each
+set's `bake_height_range`: displacement = (value - 0.5) * 2 * range, i.e. midlevel 0.5 and scale 2 * range in
+Blender's Displacement node. Export it with `bake_height=true` (§10), look at it with `render(mode="bake_height")`,
+and use it in masks as `{"type": "bake", "map": "height"}` (`"range": [1, 0]` for dirt in the low areas).
+
 ```json
 "bake": {"normal": {"high": "crate_high.glb", "cage": 0.02, "depth": 0.02, "bevel": {"radius": 0.006}}}
 ```
@@ -338,6 +350,7 @@ from the low poly and the bevelled normal adds to the curvature.
 | `cage_mesh` | none | explicit cage: a pushed copy of the low with the same triangles (e.g. exported from Blender). Rays go from the cage through the low; `cage`, `skew` and the masks are ignored. |
 | `ao_from_high` | true | AO and thickness of the high poly (bolts and creases occlude). The whole high mesh occludes, so parts ground each other. `false` keeps the low poly's. |
 | `curvature_from_high` | true | curvature of the high-poly surface: soft where its bevels are wide, none along the low poly's facets, and details that only exist on the high poly show. Each separate piece of the high poly (a bolt pushed into a plate) has its own curvature. `false` keeps the low poly's hard edges plus what the baked normal adds. |
+| `height_range` | `"auto"` | how far below / above the low surface height 0 and 1 are (fraction of object size). `auto` uses the farthest any texel lands, so the map uses its whole range; set a number to share one scale across assets. Hits beyond it clamp. |
 | `ignore_backfaces`, `denoise` | true | |
 
 - Check `render(mode="bake_normal")`, `render(mode="bake_misses")`, `render(mode="bake_ao")` and `render(mode="curvature")` before texturing.

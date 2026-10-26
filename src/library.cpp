@@ -319,7 +319,8 @@ static const char* kBuiltinLibrary = R"JSON(
       {"key": "opacity", "file": "{set}_opacity.png", "r": "opacity"},
       {"key": "bake_ao", "file": "{set}_bake_ao.png", "r": "bake_ao"},
       {"key": "curvature", "file": "{set}_curvature.png", "r": "curvature"},
-      {"key": "thickness", "file": "{set}_thickness.png", "r": "thickness"}]}
+      {"key": "thickness", "file": "{set}_thickness.png", "r": "thickness"},
+      {"key": "bake_height", "file": "{set}_bake_height.png", "r": "bake_height", "bits": 16, "if_baked": "height"}]}
 }
 }
 )JSON";

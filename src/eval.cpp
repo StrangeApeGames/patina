@@ -497,6 +497,7 @@ static void f_bake(const Json& s, Ctx& c, float* out) {
   else if (map == "convexity") par(c.n, [&](size_t i) { out[i] = convex_of(ss.curvature[i]); });
   else if (map == "concavity") par(c.n, [&](size_t i) { out[i] = concave_of(ss.curvature[i]); });
   else if (map == "thickness") par(c.n, [&](size_t i) { out[i] = ss.thickness[i]; });
+  else if (map == "height") par(c.n, [&](size_t i) { out[i] = ss.height.empty() ? 0.5f : ss.height[i]; });
   else if (map.rfind("position_", 0) == 0 && map.size() == 10) {
     int ax = map[9] - 'x';
     if (ax < 0 || ax > 2) c.error("bad map '%s'", map.c_str());
@@ -510,7 +511,7 @@ static void f_bake(const Json& s, Ctx& c, float* out) {
     par(c.n, [&](size_t i) { out[i] = hash_float((uint32_t)c.mesh->tri_island[ss.tri[i]] * 7919u + seed * 104729u + 1u); });
   } else if (map == "uv_u") par(c.n, [&](size_t i) { out[i] = ss.uv[i].x; });
   else if (map == "uv_v") par(c.n, [&](size_t i) { out[i] = ss.uv[i].y; });
-  else c.error("unknown bake map '%s' (ao curvature convexity concavity thickness position_x|y|z normal_x|y|z island uv_u uv_v)", map.c_str());
+  else c.error("unknown bake map '%s' (ao curvature convexity concavity thickness height position_x|y|z normal_x|y|z island uv_u uv_v)", map.c_str());
 }
 
 // ---------------------------------------------------------------- generators
@@ -1045,7 +1046,7 @@ static const std::vector<FieldDef>& field_defs() {
       {"cavity", "mesh", "1 - ambient occlusion (crevices are 1).", {}, f_cavity},
       {"thickness", "mesh", "Baked thickness (1 = thick, 0 = thin parts).", {}, f_thickness},
       {"bake", "mesh", "Raw baked/geometric map.",
-       {{"map", "\"ao\"", "ao | curvature | convexity | concavity | thickness | position_x|y|z (bbox 0..1) | normal_x|y|z | island | uv_u | uv_v"},
+       {{"map", "\"ao\"", "ao | curvature | convexity | concavity | thickness | height (high poly, 0.5 = low surface) | position_x|y|z (bbox 0..1) | normal_x|y|z | island | uv_u | uv_v"},
         {"seed", "0", "for island"}},
        f_bake},
       {"edge_wear", "generator", "Worn convex edges (like Substance's Metal Edge Wear): curvature + noise breakup.",
@@ -1656,7 +1657,10 @@ SetMaps make_maps(const SampleSet& ss, const SetResult& r, const std::vector<std
     } else if (e == "bake_ao") to_image(ss, ss.ao.data(), 1, img.data());
     else if (e == "curvature") to_image(ss, ss.curvature.data(), 1, img.data());
     else if (e == "thickness") to_image(ss, ss.thickness.data(), 1, img.data());
-    else if (e == "bake_misses") {
+    else if (e == "bake_height") {
+      if (ss.height.empty()) continue;
+      to_image(ss, ss.height.data(), 1, img.data());
+    } else if (e == "bake_misses") {
       if (ss.nmiss.empty()) continue;
       std::vector<float> f(ss.size());
       for (size_t i = 0; i < f.size(); i++) f[i] = ss.nmiss[i];

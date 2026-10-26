@@ -1,4 +1,4 @@
-// Mesh-map baking into UV space: surface samples per texel + AO, thickness, curvature.
+// Mesh-map baking into UV space: surface samples per texel + AO, thickness, curvature (and height from a high poly).
 #pragma once
 #include <functional>
 #include <memory>
@@ -36,6 +36,9 @@ struct NormalBakeSettings {
   // on the high poly. Texels that find no high-poly surface keep the low poly's values.
   bool ao_from_high = true;         // AO and thickness (the whole high mesh occludes: parts ground each other)
   bool curvature_from_high = true;  // curvature of the high-poly surface instead of the low poly's edges
+  // Height map (with a high poly): how far the high-poly surface lies above or below the low's, for parallax,
+  // tessellation and displacement. 0.5 = on the low surface, 0 and 1 = height_range below and above it.
+  float height_range = 0.f;         // fraction of the largest dimension; 0 = auto (the farthest any texel lands)
   std::string base_dir;           // project directory for mask files (not part of the settings hash)
 
   bool active() const { return !high.empty() || bevel_radius > 0.f; }
@@ -75,6 +78,8 @@ struct SampleSet {
   std::vector<float> ao, thickness, curvature;
   std::vector<vec3> nmap;       // baked tangent-space normal (MikkTSpace, +Y = OpenGL); empty = none
   std::vector<uint8_t> nmiss;   // 1 = no high-poly surface found (cage too tight or no matching part)
+  std::vector<float> height;    // baked high-poly height, 0.5 = low surface (see height_range); empty = no high poly
+  float height_range = 0;       // world units for height 0 / 1 (the same for every set)
   std::vector<int32_t> pad;  // res*res -> nearest sample (padding / 2D neighborhood ops)
   size_t size() const { return texel.size(); }
   size_t interior_count = 0;
@@ -105,8 +110,8 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
 class Gpu;
 struct GpuSample;
 struct GpuScene;
-// Normal bake (bake_normal.cpp): fills SampleSet::nmap/nmiss. With a high poly it also moves AO, thickness
-// and curvature onto the high-poly surface; without one the bevelled normal adds to the curvature.
+// Normal bake (bake_normal.cpp): fills SampleSet::nmap/nmiss. With a high poly it also bakes the height map and
+// moves AO, thickness and curvature onto the high-poly surface; without one the bevelled normal adds to the curvature.
 // gpu = null bakes on the CPU.
 void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& s, Json& stats, Gpu* gpu);
 

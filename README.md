@@ -27,7 +27,7 @@ Substance Painter is built for people with a mouse. Agents need:
 | Scale | **Parallelism everywhere**: baking, evaluation, rendering and PNG encoding use every core, MCP tool calls run concurrently, and `batch`/`variants` fan out across assets and alternatives. |
 | Bakes that don't interrupt the loop | A **GPU baker**: AO, thickness, the high-to-low projection and the bevel are ray traced in compute shaders, about 10x faster than 32 CPU threads end to end, with an automatic CPU fallback and `bake --verify` to compare the two. |
 | No UV seams | **3D procedural noise evaluated at the surface position**, so noise is seamless across seams. |
-| Normal maps without the fuss | A **high-to-low normal baker** with automatic cage, automatic anti-skew and `_low`/`_high` name matching (no bleed between parts), plus a **bevel shader** that bakes rounded edges from the low poly alone. MikkTSpace throughout. |
+| Normal maps without the fuss | A **high-to-low normal baker** with automatic cage, automatic anti-skew and `_low`/`_high` name matching (no bleed between parts), plus a **bevel shader** that bakes rounded edges from the low poly alone. MikkTSpace throughout. The same projection bakes a 16-bit **height map** for parallax and tessellation. |
 | Engine-ready output | Export presets for Blender, glTF (ORM), Unreal, Unity HDRP/URP and Godot, plus a textured `.glb`, the mesh as **USD** (`.usda`, `.usdc` or `.usdz`) with materials that read the exported maps, and a Blender bridge that builds the materials. |
 
 <p>
@@ -241,7 +241,7 @@ patina guide                                                            # the ag
 | `src/mesh.*` | glTF/GLB/OBJ loading, tangents, UV islands, inspection |
 | `src/bvh.*` | SAH BVH with early split clipping |
 | `src/bake.*` | UV rasterization with gutter samples, AO and thickness (ray traced on a subsampled lattice), edge-integral curvature, padding, disk cache |
-| `src/bake_normal.cpp` | high-to-low normal projection (cage, skew, bake groups), bevel shader, AO, thickness and curvature of the high poly |
+| `src/bake_normal.cpp` | high-to-low normal projection (cage, skew, bake groups), bevel shader, height map, AO, thickness and curvature of the high poly |
 | `src/gpu.*`, `src/bake_gpu.*` | GPU compute layer (Direct3D 11) and the host side of the bake kernels |
 | `src/shaders/bake.hlsl` | the bake kernels: BVH traversal and the ray-traced estimators, mirroring the CPU ones |
 | `src/eval.*` | fields, generators, mask stacks, blend modes, height→normal |

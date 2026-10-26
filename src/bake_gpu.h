@@ -42,7 +42,8 @@ struct GpuProjIn {
   vec3 dir; float pad0;
   vec3 pc; float pad1;
 };
-struct GpuProjOut { vec3 n; uint32_t flags; vec3 hit_p; uint32_t hit_tri; };  // hit_*: where the texel lands on the high poly
+// hit_*: where the texel lands on the high poly; height: its supersamples' mean height above the low surface
+struct GpuProjOut { vec3 n; uint32_t flags; vec3 hit_p; uint32_t hit_tri; float height; float pad[3]; };
 enum : uint32_t { kGpuOutMiss = 1, kGpuOutBevel = 2, kGpuOutHit = 4, kGpuOutNear = 8 };
 struct GpuTriAttr { vec3 n0; uint32_t bevel_bvh; vec3 n1; uint32_t pad1; vec3 n2; uint32_t pad2; };
 struct GpuEdgeCell { uint32_t key_lo, key_hi, start, count; };

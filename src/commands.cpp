@@ -291,7 +291,7 @@ Json verify_bake(const Project& p, int res_override) {
     }
   };
   // outliers: texels more than 2/255 (scalar maps) or 1 degree (normals) apart
-  Diff ao, thickness, curvature, normal;
+  Diff ao, thickness, curvature, normal, height;
   int64_t miss_flips = 0;
   for (size_t si = 0; si < g->sets.size(); si++) {
     const SampleSet &a = g->sets[si], &b = c->sets[si];
@@ -300,6 +300,7 @@ Json verify_bake(const Project& p, int res_override) {
       thickness.add(std::fabs(a.thickness[i] - b.thickness[i]), 2.0 / 255);
       curvature.add(std::fabs(a.curvature[i] - b.curvature[i]), 2.0 / 255);
     }
+    for (size_t i = 0; i < a.height.size(); i++) height.add(std::fabs(a.height[i] - b.height[i]), 2.0 / 255);
     for (size_t i = 0; i < a.nmap.size(); i++) {
       normal.add(std::acos(clampf(dot(a.nmap[i], b.nmap[i]), -1.f, 1.f)) * 180.0 / kPi, 1.0);
       miss_flips += a.nmiss[i] != b.nmiss[i];
@@ -309,13 +310,14 @@ Json verify_bake(const Project& p, int res_override) {
   maps.set("ao", ao.json("diff"));
   maps.set("thickness", thickness.json("diff"));
   maps.set("curvature", curvature.json("diff"));
+  if (height.n) maps.set("height", height.json("diff"));
   if (normal.n) {
     Json nj = normal.json("degrees");
     nj.set("miss_flips", miss_flips);
     maps.set("normal", nj);
   }
   double worst = 0;
-  for (const Diff* d : {&ao, &thickness, &curvature, &normal}) worst = std::max(worst, d->n ? (double)d->over / d->n : 0.0);
+  for (const Diff* d : {&ao, &thickness, &curvature, &normal, &height}) worst = std::max(worst, d->n ? (double)d->over / d->n : 0.0);
   r.set("gpu", strf("%s (%s)", gpu->name().c_str(), gpu->backend()));
   r.set("ok", worst < 0.005);  // under 0.5% outlier texels in every map
   r.set("gpu_ms", gpu_ms);
@@ -347,8 +349,10 @@ CommandOutput cmd_bake(const Json& a) {
     std::vector<std::string> labels;
     for (auto& ss : bk->sets) {
       std::vector<float> img((size_t)ss.res * ss.res);
-      struct { const char* name; const std::vector<float>* v; } maps[] = {{"ao", &ss.ao}, {"curvature", &ss.curvature}, {"thickness", &ss.thickness}};
+      struct { const char* name; const std::vector<float>* v; } maps[] = {
+          {"ao", &ss.ao}, {"curvature", &ss.curvature}, {"thickness", &ss.thickness}, {"height", &ss.height}};
       for (auto& mp : maps) {
+        if (mp.v->empty()) continue;  // height: no high poly
         to_image(ss, mp.v->data(), 1, img.data());
         std::string f = path_join(dir, sanitize_filename(ss.name) + "_" + mp.name + ".png");
         save_png(f, ss.res, ss.res, 1, img.data(), false, 8);
@@ -366,7 +370,7 @@ CommandOutput cmd_bake(const Json& a) {
         labels.push_back(ss.name + " " + mp.name);
       }
     }
-    RgbImage sheet = compose_grid(tiles, labels, 3, "baked maps");
+    RgbImage sheet = compose_grid(tiles, labels, bk->sets.empty() || bk->sets[0].height.empty() ? 3 : 4, "baked maps");
     std::string png = encode_png_rgb8(sheet.w, sheet.h, sheet.px.data());
     std::string sp = path_join(dir, sanitize_filename(p.name()) + "_bake.png");
     write_file_or_throw(sp, png);
@@ -405,7 +409,8 @@ static RenderOptions project_render_options(const Project& p, const Json& a) {
 std::vector<std::string> extra_maps_for_mode(const std::string& mode) {
   std::vector<std::string> e;
   if (mode.rfind("mask:", 0) == 0) e.push_back(mode);
-  if (mode == "curvature" || mode == "thickness" || mode == "bake_ao" || mode == "bake_normal" || mode == "bake_misses") e.push_back(mode);
+  if (mode == "curvature" || mode == "thickness" || mode == "bake_ao" || mode == "bake_height" || mode == "bake_normal" || mode == "bake_misses")
+    e.push_back(mode);
   return e;
 }
 
@@ -574,7 +579,8 @@ CommandOutput cmd_export(const Json& a) {
   EvalOptions opt;
   Json eval_stats, warnings;
   auto results = evaluate_all(p, *bk, opt, &eval_stats, &warnings);
-  Json r = export_textures(p, *bk, results, preset, out, a.boolean("glb", false), usd_format);
+  bool bake_height = a.boolean("bake_height", p.doc["export"].boolean("bake_height", false));
+  Json r = export_textures(p, *bk, results, preset, out, a.boolean("glb", false), usd_format, bake_height);
   r.set("warnings", warnings);
   r.set("bake_ms", bake_stats.num("total_ms", 0));
   r.set("eval", eval_stats);

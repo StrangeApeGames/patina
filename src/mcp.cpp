@@ -66,7 +66,7 @@ static const ToolDef kTools[] = {
     {"render", "render",
      "Render the textured asset (CPU PBR, headless) and return the image. views: comma list of front, back, left, right, top, bottom, "
      "iso, iso_back, iso_left, iso_back_left, low, or \"az:el\", or objects {azimuth, elevation, zoom, target:[x,y,z]} for close-ups. "
-     "mode: lit | clay | basecolor | roughness | metallic | normal | height | ao | curvature | thickness | bake_ao | mask:<layer_id> | islands | parts | uv_checker. "
+     "mode: lit | clay | basecolor | roughness | metallic | normal | height | ao | curvature | thickness | bake_ao | bake_height | mask:<layer_id> | islands | parts | uv_checker. "
      "sheet=true shows the flat texture maps instead; uv_layout=true draws each texture set's UV layout. Lighting: a studio HDRI by default (environment=\"studio\"); "
      "environment can also be a path to an equirectangular .hdr or \"procedural\"; env_rotation (degrees) turns it to move reflections. "
      "A project's \"render\" block sets defaults.",
@@ -82,11 +82,12 @@ static const ToolDef kTools[] = {
      "variants: [{\"label\":\"heavy rust\",\"ops\":[{\"op\":\"update\",\"id\":\"rust\",\"patch\":{\"params\":{\"rust\":0.8}}}]}, ...]. Apply the winner with edit.",
      R"~({"type":"object","properties":{"project":{"type":"string"},"variants":{"type":"array","items":{"type":"object"}},
         "views":{},"mode":{"type":"string"},"size":{"type":"integer"},"resolution":{"type":"integer"}},"required":["project","variants"]})~"},
-    {"bake", "bake", "Bake (or re-bake with force=true) mesh maps: AO, curvature, thickness, normals. preview=true returns an image of them. Other commands bake automatically. Runs on the GPU when there is one (stats.device); verify=true bakes on GPU and CPU and reports how far apart the maps are.",
+    {"bake", "bake", "Bake (or re-bake with force=true) mesh maps: AO, curvature, thickness, normals, and height with a high poly (stats.height_range). preview=true returns an image of them. Other commands bake automatically. Runs on the GPU when there is one (stats.device); verify=true bakes on GPU and CPU and reports how far apart the maps are.",
      R"~({"type":"object","properties":{"project":{"type":"string"},"force":{"type":"boolean"},"preview":{"type":"boolean"},"verify":{"type":"boolean"},"resolution":{"type":"integer"}},"required":["project"]})~"},
     {"export", "export", "Export final textures + manifest.json. preset: blender (default) | gltf | unreal | unity_hdrp | unity_urp | godot | maps. glb=true also writes a textured .glb. "
+     "bake_height=true also writes {set}_bake_height.png (16-bit, 0.5 = low surface, manifest bake_height_range = world units for 0/1) for parallax or tessellation; needs bake.normal.high. "
      "usd=true also writes the mesh as USD (.usda) with UsdPreviewSurface materials that read the exported textures; usd=\"usdc\" writes binary, usd=\"usdz\" one file with the textures inside.",
-     R"~({"type":"object","properties":{"project":{"type":"string"},"preset":{"type":"string"},"out":{"type":"string"},"glb":{"type":"boolean"},
+     R"~({"type":"object","properties":{"project":{"type":"string"},"preset":{"type":"string"},"out":{"type":"string"},"glb":{"type":"boolean"},"bake_height":{"type":"boolean"},
         "usd":{"description":"true (= \"usda\", text) | \"usda\" | \"usdc\" (binary) | \"usdz\" (one file with the textures inside)"},
         "resolution":{"type":"integer"}},"required":["project"]})~"},
     {"library", "library", "List smart materials (with params), field/generator types (with params), channels, blend modes, export presets, render modes. topic narrows it: guide (full agent guide with recipes - read this first) | smart_materials | fields | channels | blend_modes | export_presets | render | modifiers.",

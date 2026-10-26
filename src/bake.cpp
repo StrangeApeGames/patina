@@ -725,13 +725,17 @@ static bool load_cache(const std::string& path, std::vector<SampleSet>& sets) {
       if (!rd(&nn, 8) || (nn != 0 && nn != n)) return false;
       ss.nmap.resize(nn); ss.nmiss.resize(nn);
       if (!rd(ss.nmap.data(), nn * sizeof(vec3)) || !rd(ss.nmiss.data(), nn)) return false;
+      uint64_t nh = 0;
+      if (!rd(&nh, 8) || (nh != 0 && nh != n)) return false;
+      ss.height.resize(nh);
+      if (!rd(ss.height.data(), nh * 4) || !rd(&ss.height_range, 4)) return false;
     }
     return true;
   };
   bool ok = load();
   fclose(f);
   if (!ok)  // a damaged file: leave no half-read maps behind
-    for (auto& ss : sets) { ss.ao.clear(); ss.thickness.clear(); ss.curvature.clear(); ss.nmap.clear(); ss.nmiss.clear(); }
+    for (auto& ss : sets) { ss.ao.clear(); ss.thickness.clear(); ss.curvature.clear(); ss.nmap.clear(); ss.nmiss.clear(); ss.height.clear(); }
   return ok;
 }
 
@@ -747,7 +751,7 @@ static void save_cache(const std::string& path, const std::vector<SampleSet>& se
   wr(&magic, 4);
   wr(&count, 4);
   for (auto& ss : sets) {
-    uint64_t n = ss.size(), nn = ss.nmap.size();
+    uint64_t n = ss.size(), nn = ss.nmap.size(), nh = ss.height.size();
     wr(&n, 8);
     wr(ss.ao.data(), n * 4);
     wr(ss.thickness.data(), n * 4);
@@ -755,6 +759,9 @@ static void save_cache(const std::string& path, const std::vector<SampleSet>& se
     wr(&nn, 8);
     wr(ss.nmap.data(), nn * sizeof(vec3));
     wr(ss.nmiss.data(), nn);
+    wr(&nh, 8);
+    wr(ss.height.data(), nh * 4);
+    wr(&ss.height_range, 4);
   }
   ok = fclose(f) == 0 && ok;
   std::error_code ec;
@@ -828,7 +835,7 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
   bool want_gpu = device == BakeDevice::Gpu || (device == BakeDevice::Auto && texels >= kGpuMinTexels && Gpu::enabled());
 
   // bump when baker output changes so stale disk caches are never reused
-  static const uint64_t kBakerVersion = 7;
+  static const uint64_t kBakerVersion = 8;
   uint64_t key = fnv1a(&kBakerVersion, sizeof kBakerVersion, m.content_hash ^ s.hash());
   for (int r : res_per_set) key = fnv1a(&r, sizeof r, key);
   // the high poly and the cage count by their file contents; the high poly itself is only loaded for a real bake
@@ -943,6 +950,8 @@ std::shared_ptr<Baked> bake_mesh(std::shared_ptr<const Mesh> mesh, const std::ve
     sets.set(ss.name, sj);
   }
   stats.set("texture_sets", sets);
+  // the baked height map's scale (also when it came from the cache): 0 and 1 are this far below / above the low
+  if (!bk->sets.empty() && !bk->sets[0].height.empty()) stats.set("height_range", bk->sets[0].height_range);
   stats.set("total_ms", total.ms());
   stats.set("threads", thread_count());
   bk->stats = stats;

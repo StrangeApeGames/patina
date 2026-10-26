@@ -27,11 +27,12 @@ usage: patina <command> [args] [--flags]      (all commands print JSON)
   get      <project> [--outline]               print the project (or a compact outline)
   edit     <project> <ops.json | - | '[{...}]'> apply edit ops (see `patina library`)
   validate <project>                           check for errors/typos
-  bake     <project> [--force] [--preview]     bake AO/curvature/thickness/normals (cached; on the GPU when there is one)
+  bake     <project> [--force] [--preview]     bake AO/curvature/thickness/normals/height (cached; on the GPU when there is one)
   bake     <project> --verify                  bake on the GPU and the CPU and compare the maps
   render   <project> [-o out.png] [--views iso,front] [--mode lit] [--size 512] [--sheet]
   variants <project> <variants.json>           render alternatives side by side
   export   <project> [--preset blender|gltf|unreal|unity_hdrp|unity_urp|godot|maps] [-o dir] [--glb]
+           [--bake-height]                     also write the height baked from the high poly (16-bit)
            [--usd [usda|usdc|usdz]]            also write the mesh as USD, with materials that read the textures
   library  [--topic smart_materials|fields|channels|blend_modes|export_presets|render|modifiers]
   batch    <jobs.json> [-j 8]                  run many commands concurrently

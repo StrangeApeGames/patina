@@ -210,6 +210,25 @@ concave_low=$("$PY" tests/map_stats.py "$W/maps_low/Plate_curvature.png" | cut -
 "$PY" -c "import sys; sys.exit(0 if float('$concave_high') > 0.005 and float('$concave_low') < 0.001 else 1)" || fail "curvature should follow the high poly (concave: $concave_high from the high, $concave_low from the low)"
 ok "AO, thickness and curvature from the high poly"
 
+# height from the high poly: the plate's raised panel and the bolt heads stand above the low surface (0.5), one
+# range for every set, exported at 16 bits with that range in the manifest; without a high poly there is none
+[ "$(echo "$out" | json "d['stats']['height_range'] > 0")" = "True" ] || fail "height is baked with the other maps on the low poly too"
+[ "$("$BIN" bake "$W/bevel.patina.json" --compact | json "'height_range' in d['stats']")" = "False" ] || fail "no height map without a high poly"
+out=$("$BIN" bake "$W/bake.patina.json" --compact)
+[ "$(echo "$out" | json "d['stats']['height_range'] > 0 and d['stats']['from_cache']")" = "True" ] || fail "height range (also from the cache)"
+read -r below above < <("$PY" tests/map_stats.py "$W/maps_high/Plate_height.png" | tr -d '\r')
+"$PY" -c "import sys; sys.exit(0 if float('$above') > 0.05 and float('$below') < 0.01 else 1)" || fail "the raised panel should be above the low surface ($below below, $above above)"
+"$BIN" export "$W/bake.patina.json" --preset unreal --bake-height --out "$W/tex_height" --compact >/dev/null || fail "export --bake-height"
+[ "$("$PY" -c "import json; m = json.load(open('$W/tex_height/manifest.json'))['texture_sets']; print(all(s['files'].get('bake_height') and s['bake_height_range'] > 0 for s in m.values()))")" = "True" ] || fail "bake_height in the manifest"
+[ "$(od -An -tu1 -j24 -N1 "$W/tex_height/Plate_bake_height.png" | tr -d ' ')" = "16" ] || fail "bake_height should be 16-bit"
+"$BIN" render "$W/bake.patina.json" --views iso --size 96 --mode bake_height --out "$W/bake_height.png" --compact >/dev/null || fail "render bake_height"
+set +e
+out=$("$BIN" export "$W/bevel.patina.json" --bake-height --out "$W/tex_noheight" --compact)
+code=$?
+set -e
+[ $code -ne 0 ] && echo "$out" | grep -q "bake.normal.high" || fail "bake_height without a high poly should fail"
+ok "height map from the high poly"
+
 # GPU baker: `bake --verify` bakes on the GPU and on the CPU and compares every map. Runs on this machine's GPU
 # when it has one, otherwise on Direct3D's software rasterizer (CI), and is skipped where there is no backend.
 gpu_of() { "$BIN" bake "$1" --verify --compact | json "d['verify']['gpu']"; }

@@ -83,6 +83,7 @@ Json render_modes() {
   j.set("curvature", "baked curvature (0.5 = flat)");
   j.set("thickness", "baked thickness");
   j.set("bake_ao", "baked ambient occlusion only");
+  j.set("bake_height", "the height baked from the high poly (0.5 = on the low surface)");
   j.set("bake_normal", "the baked tangent-space normal map alone (high poly / bevel shader), as colors");
   j.set("bake_misses", "red where the normal bake found no high-poly surface: widen bake.normal cage/depth or fix part names");
   j.set("mask:<layer_id>", "a layer's effective mask in red over clay - debug where a layer applies");
@@ -455,8 +456,8 @@ RgbImage render_view(const Mesh& m, const BVH& bvh, const std::vector<SetMaps>& 
           }
           c = vec3(bn[0] * 0.5f + 0.5f, bn[1] * 0.5f + 0.5f, bn[2] * 0.5f + 0.5f) * -1.f;
         }
-        else if (mode == "height" || mode == "curvature" || mode == "thickness" || mode == "bake_ao") {
-          float h = 0;
+        else if (mode == "height" || mode == "curvature" || mode == "thickness" || mode == "bake_ao" || mode == "bake_height") {
+          float h = mode == "bake_height" ? 0.5f : 0.f;
           if (sm) {
             if (mode == "height") { sample_map(sm->ch[C_HEIGHT], 1, res, uv.x, uv.y, &h); h = saturate(0.5f + 0.5f * h); }
             else {

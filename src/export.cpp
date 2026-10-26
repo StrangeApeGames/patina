@@ -24,9 +24,9 @@ struct Sources {
     if (name == "ao") return one(m->ch[C_AO][t]);
     if (name == "opacity") return one(m->ch[C_OPACITY][t]);
     if (name == "height") return one(saturate(0.5f + 0.5f * m->ch[C_HEIGHT][t]));
-    if (name == "bake_ao" || name == "curvature" || name == "thickness") {
+    if (name == "bake_ao" || name == "curvature" || name == "thickness" || name == "bake_height") {
       auto it = m->extra.find(name);
-      return one(it == m->extra.end() ? 0.f : it->second[t]);
+      return one(it == m->extra.end() ? (name == "bake_height" ? 0.5f : 0.f) : it->second[t]);
     }
     if (name == "basecolor" || name == "emissive") {
       const float* c = &m->ch[name == "basecolor" ? C_BASECOLOR : C_EMISSIVE][t * 3];
@@ -181,7 +181,7 @@ static void write_map(const Json& spec, const SetMaps& m, bool directx, const st
 }
 
 Json export_textures(const Project& p, const Baked& bk, const std::vector<SetResult>& results, const std::string& preset_name,
-                     const std::string& out_dir, bool write_glb, const std::string& usd_format) {
+                     const std::string& out_dir, bool write_glb, const std::string& usd_format, bool bake_height) {
   const Json* preset = find_export_preset(preset_name);
   if (!preset) {
     std::string dym = did_you_mean(preset_name, builtin_library()["export_presets"].keys());
@@ -195,7 +195,9 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
   float ext = mesh.max_extent();
 
   std::vector<SetMaps> maps(results.size());
-  std::vector<std::string> extra = {"bake_ao", "curvature", "thickness"};
+  bool height_baked = !bk.sets.empty() && !bk.sets[0].height.empty();
+  if (bake_height && !height_baked) fail("bake_height needs a height map baked from a high poly: set bake.normal.high");
+  std::vector<std::string> extra = {"bake_ao", "curvature", "thickness", "bake_height"};
   for (size_t i = 0; i < results.size(); i++) maps[i] = make_maps(bk.sets[results[i].set], results[i], extra);
 
   Json manifest = Json::object();
@@ -208,14 +210,22 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
   std::vector<Task> tasks;
   std::vector<UsdMaterial> usd_materials;
   UsdRemaps usd_remaps;
+  // the preset's maps, and the baked height when it is asked for and the preset has no map of it
+  std::vector<const Json*> specs;
+  for (auto& spec : (*preset)["maps"].items()) specs.push_back(&spec);
+  Json height_spec = Json::parse(R"({"key": "bake_height", "file": "{set}_bake_height.png", "r": "bake_height", "bits": 16})");
+  if (bake_height && std::none_of(specs.begin(), specs.end(), [](const Json* s) { return s->str("r", "") == "bake_height"; }))
+    specs.push_back(&height_spec);
   for (auto& m : maps) {
     Json sj = Json::object();
     sj.set("material", m.name);
     Json fj = Json::object();
     std::vector<WrittenMap> written;
-    for (auto& spec : (*preset)["maps"].items()) {
+    for (const Json* sp : specs) {
+      const Json& spec = *sp;
       std::string if_used = spec.str("if_used", "");
       if (!if_used.empty() && !channel_used(m, if_used)) continue;
+      if (spec.str("if_baked", "") == "height" && !height_baked) continue;
       std::string fname = spec.str("file", "{set}.png");
       size_t pos = fname.find("{set}");
       if (pos != std::string::npos) fname.replace(pos, 5, sanitize_filename(m.name));
@@ -228,6 +238,8 @@ Json export_textures(const Project& p, const Baked& bk, const std::vector<SetRes
     sj.set("files", fj);
     sj.set("normal_format", directx ? "directx" : "opengl");
     sj.set("height_depth", p.height_depth() * ext);
+    // bake_height: 0.5 is the low surface, 0 and 1 are this far (world units) below and above it
+    if (height_baked) sj.set("bake_height_range", bk.sets[m.set].height_range);
     sj.set("resolution", m.res);
     sets.set(m.name, sj);
   }

@@ -21,6 +21,9 @@
 // Mesh maps: with a high poly, AO, thickness and curvature are measured where each texel lands on the
 // high-poly surface (as Toolbag bakes them), so masks follow its bevels, bolts and creases instead of the low
 // poly's edges. Without one, the bevelled normal is turned into extra curvature so edge wear follows it.
+//
+// Height: how far above or below the low surface the high-poly hits lie (along the low's shading normal),
+// averaged over a texel's supersamples, for parallax and tessellation. One range serves every texture set.
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -55,6 +58,11 @@ void NormalBakeSettings::from_json(const Json& j) {
   cage_mesh = j.str("cage_mesh", cage_mesh);
   ao_from_high = j.boolean("ao_from_high", ao_from_high);
   curvature_from_high = j.boolean("curvature_from_high", curvature_from_high);
+  if (const Json* hr = j.find("height_range")) {
+    if (hr->is_string() && to_lower(hr->as_str()) == "auto") height_range = 0.f;
+    else if (hr->is_number() && hr->as_float() > 0) height_range = std::clamp(hr->as_float(), 1e-5f, 1.f);
+    else fail("bake.normal.height_range must be \"auto\" or a fraction of the largest dimension (> 0)");
+  }
   auto masked = [](const Json* m, const char* key, Json& mask, float& to, float lo, float hi) {
     if (!m) return;
     if (!m->is_object() || !m->has("mask")) fail("bake.normal.%s must be {\"to\": value, \"mask\": [effects...]}", key);
@@ -90,6 +98,7 @@ Json NormalBakeSettings::to_json() const {
   j.set("cage_mesh", cage_mesh);
   j.set("ao_from_high", ao_from_high);
   j.set("curvature_from_high", curvature_from_high);
+  j.set("height_range", height_range > 0 ? Json(height_range) : Json("auto"));
   if (!cage_mask.is_null()) { Json m = Json::object(); m.set("to", cage_to); m.set("mask", cage_mask); j.set("cage_mask", m); }
   if (!skew_mask.is_null()) { Json m = Json::object(); m.set("to", skew_to); m.set("mask", skew_mask); j.set("skew_mask", m); }
   Json b = Json::object();
@@ -535,7 +544,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     std::vector<vec3> hit_p;  // where each texel lands on the high poly (for its mesh maps)
     std::vector<uint32_t> hit_tri;
     std::vector<uint8_t> hit_ok;
-    if (maps_high) { hit_p.assign(n, vec3(0.f)); hit_tri.assign(n, 0); hit_ok.assign(n, 0); }
+    if (high) { hit_p.assign(n, vec3(0.f)); hit_tri.assign(n, 0); hit_ok.assign(n, 0); ss.height.assign(n, 0.f); }
     auto sample_seed = [&](size_t i) { return hash_u32((uint32_t)ss.texel[i] * 2654435761u + (uint32_t)ss.set * 97u); };
     Timer stage;
     if (high) {
@@ -578,7 +587,8 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         GpuProjOut r{};
         const SubBVH& g = bvhs[(int)in.group];
         vec3 acc{0, 0, 0};
-        int miss = 0;
+        int miss = 0, hits = 0;
+        float hsum = 0;
         for (int sy = 0; sy < grid; sy++)
           for (int sx = 0; sx < grid; sx++) {
             float ox = (sx + 0.5f) / grid - 0.5f, oy = (sy + 0.5f) / grid - 0.5f;
@@ -605,14 +615,17 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
             }
             if (found) {
               nh = smooth_normal(*high, ht, u, v);
+              vec3 hp = o - in.dir * th;
+              hsum += dot(hp - p, in.ns);  // height above the low surface
+              hits++;
               // the centre supersample's hit, or another one's when it misses
-              if (maps_high && ((sx == grid / 2 && sy == grid / 2) || !(r.flags & kGpuOutHit))) {
-                r.hit_p = o - in.dir * th;
+              if ((sx == grid / 2 && sy == grid / 2) || !(r.flags & kGpuOutHit)) {
+                r.hit_p = hp;
                 r.hit_tri = ht;
                 r.flags |= kGpuOutHit;
               }
               if (R > 0) {
-                vec3 nb = bevel_at(o - in.dir * th, ht, nh, in.seed + (uint32_t)(sy * grid + sx) * 7919u);
+                vec3 nb = bevel_at(hp, ht, nh, in.seed + (uint32_t)(sy * grid + sx) * 7919u);
                 if (dot(nb, nh) < 0.99999f) r.flags |= kGpuOutBevel;
                 nh = nb;
               }
@@ -624,13 +637,17 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
           }
         if (miss * 2 > grid * grid) r.flags |= kGpuOutMiss;
         r.n = normalize(acc);
+        r.height = hits ? hsum / hits : 0.f;
         return r;
       };
       auto finish = [&](size_t i, const GpuProjOut& r) {
         world[i] = r.n;
         ss.nmiss[i] = (r.flags & kGpuOutMiss) != 0;
         denoise_mask[i] = (r.flags & kGpuOutBevel) != 0;
-        if (maps_high) { hit_p[i] = r.hit_p; hit_tri[i] = r.hit_tri; hit_ok[i] = (r.flags & kGpuOutHit) != 0; }
+        hit_p[i] = r.hit_p;
+        hit_tri[i] = r.hit_tri;
+        hit_ok[i] = (r.flags & kGpuOutHit) != 0;
+        ss.height[i] = hit_ok[i] ? r.height : 0.f;
       };
       if (gpu) {
         GpuParams p = edge_params;
@@ -639,7 +656,7 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
         p.grid = (uint32_t)grid;
         p.depth = depth;
         p.bevel_r = R;
-        p.flags = (start_on_dir ? kGpuAutoSkew : 0) | (cage_m ? kGpuCageMesh : 0) | (s.ignore_backfaces ? kGpuBackfaces : 0) | (maps_high ? kGpuHit : 0);
+        p.flags = (start_on_dir ? kGpuAutoSkew : 0) | (cage_m ? kGpuCageMesh : 0) | (s.ignore_backfaces ? kGpuBackfaces : 0) | kGpuHit;
         // The bevel costs hundreds of rays where a hit is near a feature edge and nothing elsewhere. A first pass
         // projects every texel and reports the ones near an edge; a second pass bevels only those, so the
         // threads of a dispatch do similar amounts of work.
@@ -777,6 +794,25 @@ void bake_normals(Baked& bk, const Mesh* high, const BakeSettings& bs, Json& sta
     sets_j.set(ss.name, sj);
     misses_total += misses;
     samples_total += (int64_t)n;
+  }
+
+  // Height: world units -> 0..1 around 0.5, with one range for every set so they displace alike
+  if (high) {
+    float lo = 0, hi = 0;
+    for (auto& ss : sets)
+      for (float h : ss.height) { lo = std::fmin(lo, h); hi = std::fmax(hi, h); }
+    float range = s.height_range > 0 ? s.height_range * ext : std::fmax(std::fmax(-lo, hi), ext * 1e-6f);
+    for (auto& ss : sets) {
+      ss.height_range = range;
+      parallel_for((int64_t)ss.size(), 4096, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; i++) ss.height[i] = saturate(0.5f + 0.5f * ss.height[i] / range);
+      });
+    }
+    Json hj = Json::object();
+    hj.set("range", range);  // world units for height 0 and 1
+    hj.set("min", lo);       // world units below / above the low surface, before clamping to the range
+    hj.set("max", hi);
+    st.set("height", hj);
   }
 
   // Curvature from the baked normals, when it is not that of a high poly already: divergence of the
